@@ -51,6 +51,9 @@ attaches immediately.
 # reattach later
 0pty connect claude01
 
+# if there is exactly one alive session, this connects to it
+0pty connect
+
 # shorthand reattach
 0pty claude01
 

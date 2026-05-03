@@ -1235,7 +1235,36 @@ static int run_named_connect(const char *session)
     return run_client_endpoint(&endpoint, NULL, NULL, false);
 }
 
-static int run_named_list(void)
+static void opty_print_session_list(const struct opty_list_entry *entries, size_t count)
+{
+    printf("%-24s %-21s %-7s %-8s %s\n", "NAME", "ENDPOINT", "STATE", "POLICY", "CWD");
+    for (size_t i = 0; i < count; i++) {
+        char endpoint_text[160];
+
+        if (snprintf(endpoint_text, sizeof(endpoint_text), "%s:%s", entries[i].info.host, entries[i].info.port) >= (int)sizeof(endpoint_text)) {
+            continue;
+        }
+        printf("%-24s %-21s %-7s %-8s %s\n",
+               entries[i].info.name,
+               endpoint_text,
+               entries[i].alive ? "alive" : "dead",
+               entries[i].info.restart_policy[0] != '\0' ? entries[i].info.restart_policy : "manual",
+               entries[i].info.cwd[0] != '\0' ? entries[i].info.cwd : "-");
+    }
+}
+
+static void opty_free_session_entries(struct opty_list_entry *entries, size_t count)
+{
+    if (entries == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        opty_session_info_free(&entries[i].info);
+    }
+    free(entries);
+}
+
+static int opty_load_session_entries(struct opty_list_entry **entries_out, size_t *count_out)
 {
     char dir[512];
     DIR *dp;
@@ -1245,6 +1274,9 @@ static int run_named_list(void)
     size_t cap = 0;
     int status = 0;
 
+    *entries_out = NULL;
+    *count_out = 0;
+
     if (opty_session_dir(dir, sizeof(dir)) < 0) {
         perror("session directory");
         return 1;
@@ -1253,7 +1285,6 @@ static int run_named_list(void)
     dp = opendir(dir);
     if (dp == NULL) {
         if (errno == ENOENT) {
-            printf("%-24s %-21s %-7s %-8s %s\n", "NAME", "ENDPOINT", "STATE", "POLICY", "CWD");
             return 0;
         }
         perror(dir);
@@ -1308,25 +1339,62 @@ static int run_named_list(void)
         (void)pthread_join(entries[i].thread, NULL);
     }
 
-    printf("%-24s %-21s %-7s %-8s %s\n", "NAME", "ENDPOINT", "STATE", "POLICY", "CWD");
-    for (size_t i = 0; i < count; i++) {
-        char endpoint_text[160];
-
-        if (snprintf(endpoint_text, sizeof(endpoint_text), "%s:%s", entries[i].info.host, entries[i].info.port) >= (int)sizeof(endpoint_text)) {
-            continue;
-        }
-        printf("%-24s %-21s %-7s %-8s %s\n",
-               entries[i].info.name,
-               endpoint_text,
-               entries[i].alive ? "alive" : "dead",
-               entries[i].info.restart_policy[0] != '\0' ? entries[i].info.restart_policy : "manual",
-               entries[i].info.cwd[0] != '\0' ? entries[i].info.cwd : "-");
+    if (status != 0) {
+        opty_free_session_entries(entries, count);
+        return status;
     }
 
-    for (size_t i = 0; i < count; i++) {
-        opty_session_info_free(&entries[i].info);
+    *entries_out = entries;
+    *count_out = count;
+    return 0;
+}
+
+static int run_named_list(void)
+{
+    struct opty_list_entry *entries = NULL;
+    size_t count = 0;
+    int status = opty_load_session_entries(&entries, &count);
+
+    if (status != 0) {
+        return status;
     }
-    free(entries);
+    opty_print_session_list(entries, count);
+    opty_free_session_entries(entries, count);
+    return status;
+}
+
+static int run_connect_auto(void)
+{
+    struct opty_list_entry *entries = NULL;
+    size_t count = 0;
+    int status = opty_load_session_entries(&entries, &count);
+
+    if (status != 0) {
+        return status;
+    }
+
+    if (count == 0u) {
+        fprintf(stderr, "No 0pty sessions found. Start one with: 0pty NAME start <command>\n");
+        opty_free_session_entries(entries, count);
+        return 1;
+    }
+
+    if (count > 1u) {
+        opty_print_session_list(entries, count);
+        fprintf(stderr, "Multiple 0pty sessions found. Choose one with: 0pty connect NAME\n");
+        opty_free_session_entries(entries, count);
+        return 1;
+    }
+
+    if (!entries[0].alive) {
+        fprintf(stderr, "Session %s is dead. Run '0pty restart %s' to bring it back.\n",
+                entries[0].info.name, entries[0].info.name);
+        opty_free_session_entries(entries, count);
+        return 1;
+    }
+
+    status = run_named_connect(entries[0].info.name);
+    opty_free_session_entries(entries, count);
     return status;
 }
 
@@ -1442,17 +1510,20 @@ int main(int argc, char **argv)
         {0, 0, 0, 0}
     };
 
-    if (argc == 2 && opty_is_session_name(argv[1])) {
-        if (strcmp(argv[1], "list") == 0) {
-            return run_named_list();
-        }
-        return run_named_connect(argv[1]);
+    if (argc == 2 && strcmp(argv[1], "list") == 0) {
+        return run_named_list();
+    }
+    if (argc == 2 && strcmp(argv[1], "connect") == 0) {
+        return run_connect_auto();
     }
     if (argc >= 3 && strcmp(argv[1], "connect") == 0) {
         return run_named_connect(argv[2]);
     }
     if (argc >= 3 && strcmp(argv[1], "restart") == 0) {
         return run_named_restart(argv[0], argv[2]);
+    }
+    if (argc == 2 && opty_is_session_name(argv[1])) {
+        return run_named_connect(argv[1]);
     }
     if (argc >= 3 && opty_is_session_name(argv[1]) && strcmp(argv[2], "connect") == 0) {
         return run_named_connect(argv[1]);
