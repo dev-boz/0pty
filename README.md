@@ -17,9 +17,28 @@ The build uses `cc` by default, or `gcc`/another C11 compiler if you set `CC`. T
 
 `make test` builds both binaries and runs the protocol/ring-buffer regression test.
 
-## Usage
+## Recommended Workflow
 
-Default endpoints are `127.0.0.1:6077`.
+Start the agent directly, not a shell:
+
+```sh
+0pty claude01 start codex --resume
+```
+
+This means future stop, restart, and crash recovery workflows can know what
+command to run, what directory to use, and how to ask the agent to exit cleanly.
+
+Avoid this for agent sessions:
+
+```sh
+0pty claude01 start bash
+# then: codex --resume
+```
+
+That works for a persistent shell, but stop and restart become ambiguous because
+0pty cannot know what is running inside the shell.
+
+## Named Sessions
 
 The easiest workflow is named sessions. `start` allocates a localhost port,
 writes a session record under `~/.0pty/sessions`, launches `0pty-server`, and
@@ -27,29 +46,38 @@ attaches immediately.
 
 ```sh
 # start a persistent Codex session in the current directory and attach
-bin/0pty claude01 start codex
+0pty claude01 start codex
 
 # reattach later
-bin/0pty connect claude01
+0pty connect claude01
 
 # shorthand reattach
-bin/0pty claude01
+0pty claude01
+
+# list user sessions
+0pty list
 ```
 
 Commands are passed as normal argv, so extra flags work:
 
 ```sh
-bin/0pty copilot-sonnet start copilot --yolo
-bin/0pty connect copilot-sonnet
+0pty copilot-sonnet start copilot --yolo
+0pty connect copilot-sonnet
 ```
 
 The conventional order also works:
 
 ```sh
-bin/0pty start claude01 -- codex
+0pty start claude01 -- codex
 ```
 
 Session names can contain letters, digits, dots, dashes, and underscores.
+Session listing is user-scoped: `0pty list` reads only `~/.0pty/sessions` for
+the current user and checks liveness with a short TCP connect probe.
+
+## Raw Endpoint Mode
+
+Default endpoints are `127.0.0.1:6077`.
 
 Endpoint forms accepted by the shared parser:
 

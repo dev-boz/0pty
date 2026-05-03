@@ -2,10 +2,13 @@
 #include "protocol.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <netdb.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,6 +31,7 @@
 
 #define OPTY_SESSION_MAX_NAME 96
 #define OPTY_SESSION_PORT_BASE 6077ul
+#define OPTY_LIST_CONNECT_TIMEOUT_MS 250
 
 static volatile sig_atomic_t g_sigwinch_pending = 0;
 static volatile sig_atomic_t g_terminate_pending = 0;
@@ -35,6 +39,21 @@ static volatile sig_atomic_t g_terminate_pending = 0;
 static int g_raw_mode_enabled = 0;
 static int g_raw_mode_fd = -1;
 static struct termios g_saved_termios;
+
+struct opty_session_info {
+    char name[OPTY_SESSION_MAX_NAME + 1u];
+    char host[128];
+    char port[16];
+    char log[512];
+    char cwd[1024];
+    char restart_policy[64];
+};
+
+struct opty_list_entry {
+    struct opty_session_info info;
+    int alive;
+    pthread_t thread;
+};
 
 static void restore_terminal(void)
 {
@@ -641,6 +660,7 @@ static int opty_write_session(const char *session, const struct opty_endpoint *e
     fprintf(fp, "host=%s\n", endpoint->host);
     fprintf(fp, "port=%s\n", endpoint->port);
     fprintf(fp, "log=%s\n", log_path);
+    fprintf(fp, "restart_policy=manual\n");
     if (cwd[0] != '\0') {
         fprintf(fp, "cwd=%s\n", cwd);
     }
@@ -700,6 +720,166 @@ static int opty_endpoint_accepts(const struct opty_endpoint *endpoint)
     }
     close(fd);
     return 1;
+}
+
+static int opty_endpoint_accepts_timeout(const struct opty_endpoint *endpoint, int timeout_ms)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *it;
+    int alive = 0;
+    int rc;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_ADDRCONFIG;
+
+    rc = getaddrinfo(endpoint->host, endpoint->port, &hints, &res);
+    if (rc != 0) {
+        errno = EINVAL;
+        return 0;
+    }
+
+    for (it = res; it != NULL && !alive; it = it->ai_next) {
+        int fd = socket(it->ai_family, it->ai_socktype | SOCK_CLOEXEC, it->ai_protocol);
+        int flags;
+        int connect_rc;
+
+        if (fd < 0) {
+            continue;
+        }
+
+        flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(fd);
+            continue;
+        }
+
+        connect_rc = connect(fd, it->ai_addr, it->ai_addrlen);
+        if (connect_rc == 0) {
+            alive = 1;
+        } else if (errno == EINPROGRESS) {
+            struct pollfd pfd;
+
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            while ((rc = poll(&pfd, 1u, timeout_ms)) < 0 && errno == EINTR) {
+            }
+            if (rc > 0 && (pfd.revents & POLLOUT) != 0) {
+                int err = 0;
+                socklen_t err_len = sizeof(err);
+
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == 0 && err == 0) {
+                    alive = 1;
+                }
+            }
+        }
+
+        close(fd);
+    }
+
+    freeaddrinfo(res);
+    return alive;
+}
+
+static void opty_session_info_init(struct opty_session_info *info, const char *fallback_name)
+{
+    memset(info, 0, sizeof(*info));
+    if (fallback_name != NULL) {
+        snprintf(info->name, sizeof(info->name), "%s", fallback_name);
+    }
+    snprintf(info->host, sizeof(info->host), "%s", OPTY_DEFAULT_HOST);
+    snprintf(info->restart_policy, sizeof(info->restart_policy), "%s", "manual");
+}
+
+static int opty_copy_field(char *dst, size_t cap, const char *src)
+{
+    if (src == NULL || strlen(src) >= cap) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(dst, src, strlen(src) + 1u);
+    return 0;
+}
+
+static int opty_read_session_info(const char *session, struct opty_session_info *info)
+{
+    char path[1024];
+    char line[2048];
+    FILE *fp;
+
+    if (info == NULL || opty_session_path(session, path, sizeof(path)) < 0) {
+        return -1;
+    }
+
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    opty_session_info_init(info, session);
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *value;
+
+        opty_chomp(line);
+        value = strchr(line, '=');
+        if (value == NULL) {
+            continue;
+        }
+        *value++ = '\0';
+
+        if (strcmp(line, "name") == 0) {
+            if (opty_copy_field(info->name, sizeof(info->name), value) < 0) {
+                fclose(fp);
+                return -1;
+            }
+        } else if (strcmp(line, "host") == 0) {
+            if (opty_copy_field(info->host, sizeof(info->host), value) < 0) {
+                fclose(fp);
+                return -1;
+            }
+        } else if (strcmp(line, "port") == 0) {
+            if (opty_copy_field(info->port, sizeof(info->port), value) < 0) {
+                fclose(fp);
+                return -1;
+            }
+        } else if (strcmp(line, "log") == 0) {
+            if (opty_copy_field(info->log, sizeof(info->log), value) < 0) {
+                fclose(fp);
+                return -1;
+            }
+        } else if (strcmp(line, "cwd") == 0) {
+            if (opty_copy_field(info->cwd, sizeof(info->cwd), value) < 0) {
+                fclose(fp);
+                return -1;
+            }
+        } else if (strcmp(line, "restart_policy") == 0) {
+            if (opty_copy_field(info->restart_policy, sizeof(info->restart_policy), value) < 0) {
+                fclose(fp);
+                return -1;
+            }
+        }
+    }
+
+    fclose(fp);
+    if (info->port[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+static void *opty_list_probe_thread(void *arg)
+{
+    struct opty_list_entry *entry = arg;
+    struct opty_endpoint endpoint;
+
+    endpoint.host = entry->info.host;
+    endpoint.port = entry->info.port;
+    entry->alive = opty_endpoint_accepts_timeout(&endpoint, OPTY_LIST_CONNECT_TIMEOUT_MS);
+    return NULL;
 }
 
 static int opty_pick_session_endpoint(char *port_buf, size_t port_cap, struct opty_endpoint *endpoint)
@@ -927,13 +1107,17 @@ static int run_named_connect(const char *session)
 {
     char port[16];
     struct opty_endpoint endpoint;
+    struct opty_session_info info;
 
     if (!opty_is_session_name(session)) {
         fprintf(stderr, "invalid session name: %s\n", session);
         return 1;
     }
 
-    if (opty_read_session_endpoint(session, port, sizeof(port), &endpoint) < 0) {
+    if (opty_read_session_info(session, &info) == 0) {
+        endpoint.host = info.host;
+        endpoint.port = info.port;
+    } else if (opty_read_session_endpoint(session, port, sizeof(port), &endpoint) < 0) {
         if (opty_is_decimal(session) && opty_numeric_session_endpoint(session, port, sizeof(port), &endpoint) == 0) {
             return run_client_endpoint(&endpoint, NULL, NULL, false);
         }
@@ -943,6 +1127,98 @@ static int run_named_connect(const char *session)
     }
 
     return run_client_endpoint(&endpoint, NULL, NULL, false);
+}
+
+static int run_named_list(void)
+{
+    char dir[512];
+    DIR *dp;
+    struct dirent *ent;
+    struct opty_list_entry *entries = NULL;
+    size_t count = 0;
+    size_t cap = 0;
+    int status = 0;
+
+    if (opty_session_dir(dir, sizeof(dir)) < 0) {
+        perror("session directory");
+        return 1;
+    }
+
+    dp = opendir(dir);
+    if (dp == NULL) {
+        if (errno == ENOENT) {
+            printf("%-24s %-21s %-7s %-8s %s\n", "NAME", "ENDPOINT", "STATE", "POLICY", "CWD");
+            return 0;
+        }
+        perror(dir);
+        return 1;
+    }
+
+    while ((ent = readdir(dp)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        char session[OPTY_SESSION_MAX_NAME + 1u];
+
+        if (len <= 8u || strcmp(ent->d_name + len - 8u, ".session") != 0) {
+            continue;
+        }
+        if (len - 8u > OPTY_SESSION_MAX_NAME) {
+            continue;
+        }
+        memcpy(session, ent->d_name, len - 8u);
+        session[len - 8u] = '\0';
+        if (!opty_is_session_name(session)) {
+            continue;
+        }
+
+        if (count == cap) {
+            size_t new_cap = cap == 0u ? 8u : cap * 2u;
+            struct opty_list_entry *new_entries = realloc(entries, new_cap * sizeof(*new_entries));
+            if (new_entries == NULL) {
+                perror("list sessions");
+                status = 1;
+                break;
+            }
+            entries = new_entries;
+            cap = new_cap;
+        }
+
+        memset(&entries[count], 0, sizeof(entries[count]));
+        if (opty_read_session_info(session, &entries[count].info) < 0) {
+            continue;
+        }
+        count++;
+    }
+
+    closedir(dp);
+
+    for (size_t i = 0; i < count && status == 0; i++) {
+        if (pthread_create(&entries[i].thread, NULL, opty_list_probe_thread, &entries[i]) != 0) {
+            status = 1;
+            count = i;
+            break;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        (void)pthread_join(entries[i].thread, NULL);
+    }
+
+    printf("%-24s %-21s %-7s %-8s %s\n", "NAME", "ENDPOINT", "STATE", "POLICY", "CWD");
+    for (size_t i = 0; i < count; i++) {
+        char endpoint_text[160];
+
+        if (snprintf(endpoint_text, sizeof(endpoint_text), "%s:%s", entries[i].info.host, entries[i].info.port) >= (int)sizeof(endpoint_text)) {
+            continue;
+        }
+        printf("%-24s %-21s %-7s %-8s %s\n",
+               entries[i].info.name,
+               endpoint_text,
+               entries[i].alive ? "alive" : "dead",
+               entries[i].info.restart_policy[0] != '\0' ? entries[i].info.restart_policy : "manual",
+               entries[i].info.cwd[0] != '\0' ? entries[i].info.cwd : "-");
+    }
+
+    free(entries);
+    return status;
 }
 
 static int run_named_start(const char *argv0, const char *session, char **command_argv)
@@ -998,6 +1274,9 @@ int main(int argc, char **argv)
     };
 
     if (argc == 2 && opty_is_session_name(argv[1])) {
+        if (strcmp(argv[1], "list") == 0) {
+            return run_named_list();
+        }
         return run_named_connect(argv[1]);
     }
     if (argc >= 3 && strcmp(argv[1], "connect") == 0) {

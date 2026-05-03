@@ -138,6 +138,7 @@ void opty_usage_client(const char *argv0)
     fprintf(stderr, "       %s start NAME [--] [command args...]\n", prog);
     fprintf(stderr, "       %s connect NAME\n", prog);
     fprintf(stderr, "       %s NAME\n", prog);
+    fprintf(stderr, "       %s list\n", prog);
     fprintf(stderr, "       %s [-t token] [-l scrollback-file] [--retry] [host:port]\n", prog);
     fprintf(stderr, "Session names use letters, digits, dots, dashes, and underscores.\n");
     fprintf(stderr, "Session records live under ~/.0pty/sessions and allocate localhost ports automatically.\n");
