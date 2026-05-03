@@ -43,6 +43,7 @@ $(TEST_BIN): tests/protocol_ring_test.c $(SRC_DIR)/protocol.c $(SRC_DIR)/ring.c 
 test: all $(TEST_BIN)
 	$(TEST_BIN)
 	sh tests/list_dead_test.sh
+	sh tests/restart_dead_test.sh
 
 clean:
 	rm -rf $(BIN_DIR) $(wildcard $(SRC_DIR)/*.o) $(wildcard $(SRC_DIR)/*.d)

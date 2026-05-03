@@ -56,6 +56,9 @@ attaches immediately.
 
 # list user sessions
 0pty list
+
+# restart a dead session from its stored cwd and argv
+0pty restart claude01
 ```
 
 Commands are passed as normal argv, so extra flags work:
@@ -74,6 +77,9 @@ The conventional order also works:
 Session names can contain letters, digits, dots, dashes, and underscores.
 Session listing is user-scoped: `0pty list` reads only `~/.0pty/sessions` for
 the current user and checks liveness with a short TCP connect probe.
+`0pty restart NAME` works only for dead sessions. It reuses the start-time
+working directory and exact argv stored in the session file; it refuses to
+replace an alive session.
 
 ## Raw Endpoint Mode
 

@@ -32,6 +32,7 @@
 #define OPTY_SESSION_MAX_NAME 96
 #define OPTY_SESSION_PORT_BASE 6077ul
 #define OPTY_LIST_CONNECT_TIMEOUT_MS 250
+#define OPTY_SESSION_MAX_ARGC 128
 
 static volatile sig_atomic_t g_sigwinch_pending = 0;
 static volatile sig_atomic_t g_terminate_pending = 0;
@@ -47,6 +48,9 @@ struct opty_session_info {
     char log[512];
     char cwd[1024];
     char restart_policy[64];
+    char command[1024];
+    size_t argc;
+    char *argv[OPTY_SESSION_MAX_ARGC + 1u];
 };
 
 struct opty_list_entry {
@@ -637,14 +641,25 @@ static int opty_read_session_endpoint(const char *session, char *port_buf, size_
     return 0;
 }
 
-static int opty_write_session(const char *session, const struct opty_endpoint *endpoint, const char *log_path)
+static int opty_write_session(const char *session, const struct opty_endpoint *endpoint, const char *log_path, char **command_argv)
 {
     char path[1024];
     char cwd[1024];
     FILE *fp;
+    size_t argc = 0;
 
     if (opty_ensure_session_dir() < 0 || opty_session_path(session, path, sizeof(path)) < 0) {
         return -1;
+    }
+
+    if (command_argv != NULL) {
+        while (command_argv[argc] != NULL) {
+            if (argc >= OPTY_SESSION_MAX_ARGC) {
+                errno = E2BIG;
+                return -1;
+            }
+            argc++;
+        }
     }
 
     fp = fopen(path, "w");
@@ -661,6 +676,18 @@ static int opty_write_session(const char *session, const struct opty_endpoint *e
     fprintf(fp, "port=%s\n", endpoint->port);
     fprintf(fp, "log=%s\n", log_path);
     fprintf(fp, "restart_policy=manual\n");
+    fprintf(fp, "graceful_input=/exit\\n\n");
+    fprintf(fp, "argc=%zu\n", argc);
+    if (argc > 0u) {
+        fprintf(fp, "command=");
+        for (size_t i = 0; i < argc; i++) {
+            fprintf(fp, "%s%s", i == 0u ? "" : " ", command_argv[i]);
+        }
+        fprintf(fp, "\n");
+        for (size_t i = 0; i < argc; i++) {
+            fprintf(fp, "argv%zu=%s\n", i, command_argv[i]);
+        }
+    }
     if (cwd[0] != '\0') {
         fprintf(fp, "cwd=%s\n", cwd);
     }
@@ -804,6 +831,37 @@ static int opty_copy_field(char *dst, size_t cap, const char *src)
     return 0;
 }
 
+static void opty_session_info_free(struct opty_session_info *info)
+{
+    if (info == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < info->argc; i++) {
+        free(info->argv[i]);
+        info->argv[i] = NULL;
+    }
+    info->argc = 0;
+}
+
+static int opty_parse_argv_key(const char *key, size_t *index_out)
+{
+    char *end = NULL;
+    unsigned long index;
+
+    if (strncmp(key, "argv", 4u) != 0 || key[4] == '\0' || !opty_is_decimal(key + 4)) {
+        return 0;
+    }
+
+    errno = 0;
+    index = strtoul(key + 4, &end, 10);
+    if (errno != 0 || end == key + 4 || *end != '\0' || index >= OPTY_SESSION_MAX_ARGC) {
+        errno = EINVAL;
+        return -1;
+    }
+    *index_out = (size_t)index;
+    return 1;
+}
+
 static int opty_read_session_info(const char *session, struct opty_session_info *info)
 {
     char path[1024];
@@ -822,6 +880,8 @@ static int opty_read_session_info(const char *session, struct opty_session_info 
     opty_session_info_init(info, session);
     while (fgets(line, sizeof(line), fp) != NULL) {
         char *value;
+        size_t argv_index = 0;
+        int argv_key;
 
         opty_chomp(line);
         value = strchr(line, '=');
@@ -858,6 +918,39 @@ static int opty_read_session_info(const char *session, struct opty_session_info 
         } else if (strcmp(line, "restart_policy") == 0) {
             if (opty_copy_field(info->restart_policy, sizeof(info->restart_policy), value) < 0) {
                 fclose(fp);
+                opty_session_info_free(info);
+                return -1;
+            }
+        } else if (strcmp(line, "command") == 0) {
+            if (opty_copy_field(info->command, sizeof(info->command), value) < 0) {
+                fclose(fp);
+                opty_session_info_free(info);
+                return -1;
+            }
+        } else if (strcmp(line, "argc") == 0) {
+            char *end = NULL;
+            unsigned long argc;
+
+            errno = 0;
+            argc = strtoul(value, &end, 10);
+            if (errno != 0 || end == value || *end != '\0' || argc > OPTY_SESSION_MAX_ARGC) {
+                fclose(fp);
+                opty_session_info_free(info);
+                errno = EINVAL;
+                return -1;
+            }
+            info->argc = (size_t)argc;
+        } else if ((argv_key = opty_parse_argv_key(line, &argv_index)) != 0) {
+            if (argv_key < 0) {
+                fclose(fp);
+                opty_session_info_free(info);
+                return -1;
+            }
+            free(info->argv[argv_index]);
+            info->argv[argv_index] = opty_strdup(value);
+            if (info->argv[argv_index] == NULL) {
+                fclose(fp);
+                opty_session_info_free(info);
                 return -1;
             }
         }
@@ -866,8 +959,17 @@ static int opty_read_session_info(const char *session, struct opty_session_info 
     fclose(fp);
     if (info->port[0] == '\0') {
         errno = EINVAL;
+        opty_session_info_free(info);
         return -1;
     }
+    for (size_t i = 0; i < info->argc; i++) {
+        if (info->argv[i] == NULL) {
+            errno = EINVAL;
+            opty_session_info_free(info);
+            return -1;
+        }
+    }
+    info->argv[info->argc] = NULL;
     return 0;
 }
 
@@ -1108,6 +1210,7 @@ static int run_named_connect(const char *session)
     char port[16];
     struct opty_endpoint endpoint;
     struct opty_session_info info;
+    int rc;
 
     if (!opty_is_session_name(session)) {
         fprintf(stderr, "invalid session name: %s\n", session);
@@ -1117,6 +1220,9 @@ static int run_named_connect(const char *session)
     if (opty_read_session_info(session, &info) == 0) {
         endpoint.host = info.host;
         endpoint.port = info.port;
+        rc = run_client_endpoint(&endpoint, NULL, NULL, false);
+        opty_session_info_free(&info);
+        return rc;
     } else if (opty_read_session_endpoint(session, port, sizeof(port), &endpoint) < 0) {
         if (opty_is_decimal(session) && opty_numeric_session_endpoint(session, port, sizeof(port), &endpoint) == 0) {
             return run_client_endpoint(&endpoint, NULL, NULL, false);
@@ -1217,6 +1323,9 @@ static int run_named_list(void)
                entries[i].info.cwd[0] != '\0' ? entries[i].info.cwd : "-");
     }
 
+    for (size_t i = 0; i < count; i++) {
+        opty_session_info_free(&entries[i].info);
+    }
     free(entries);
     return status;
 }
@@ -1240,7 +1349,7 @@ static int run_named_start(const char *argv0, const char *session, char **comman
             perror("allocate 0pty session");
             return 1;
         }
-        if (opty_write_session(session, &endpoint, log_path) < 0) {
+        if (opty_write_session(session, &endpoint, log_path, command_argv) < 0) {
             perror("write 0pty session");
             return 1;
         }
@@ -1250,6 +1359,66 @@ static int run_named_start(const char *argv0, const char *session, char **comman
         }
     }
 
+    return run_client_endpoint(&endpoint, NULL, NULL, false);
+}
+
+static int run_named_restart(const char *argv0, const char *session)
+{
+    struct opty_session_info info;
+    struct opty_endpoint endpoint;
+    char host[128];
+    char port[16];
+    char current_cwd[1024];
+    int have_current_cwd = 0;
+
+    if (!opty_is_session_name(session)) {
+        fprintf(stderr, "invalid session name: %s\n", session);
+        return 1;
+    }
+    if (opty_read_session_info(session, &info) < 0) {
+        fprintf(stderr, "no such 0pty session: %s\n", session);
+        return 1;
+    }
+    if (info.argc == 0u) {
+        fprintf(stderr, "session %s has no stored argv; start it again with: 0pty %s start <command>\n", session, session);
+        opty_session_info_free(&info);
+        return 1;
+    }
+
+    snprintf(host, sizeof(host), "%s", info.host);
+    snprintf(port, sizeof(port), "%s", info.port);
+    endpoint.host = host;
+    endpoint.port = port;
+    if (opty_endpoint_accepts(&endpoint)) {
+        fprintf(stderr, "0pty session %s is already alive on %s:%s; use: 0pty connect %s\n",
+                session, endpoint.host, endpoint.port, session);
+        opty_session_info_free(&info);
+        return 1;
+    }
+
+    if (getcwd(current_cwd, sizeof(current_cwd)) != NULL) {
+        have_current_cwd = 1;
+    }
+    if (info.cwd[0] != '\0' && chdir(info.cwd) < 0) {
+        perror(info.cwd);
+        opty_session_info_free(&info);
+        return 1;
+    }
+
+    if (opty_spawn_server(argv0, session, &endpoint, info.log[0] != '\0' ? info.log : "/tmp/0pty-restart.log", info.argv) < 0) {
+        perror("restart 0pty session");
+        if (have_current_cwd) {
+            (void)chdir(current_cwd);
+        }
+        opty_session_info_free(&info);
+        return 1;
+    }
+
+    if (have_current_cwd) {
+        (void)chdir(current_cwd);
+    }
+
+    opty_session_info_free(&info);
     return run_client_endpoint(&endpoint, NULL, NULL, false);
 }
 
@@ -1282,8 +1451,14 @@ int main(int argc, char **argv)
     if (argc >= 3 && strcmp(argv[1], "connect") == 0) {
         return run_named_connect(argv[2]);
     }
+    if (argc >= 3 && strcmp(argv[1], "restart") == 0) {
+        return run_named_restart(argv[0], argv[2]);
+    }
     if (argc >= 3 && opty_is_session_name(argv[1]) && strcmp(argv[2], "connect") == 0) {
         return run_named_connect(argv[1]);
+    }
+    if (argc >= 3 && opty_is_session_name(argv[1]) && strcmp(argv[2], "restart") == 0) {
+        return run_named_restart(argv[0], argv[1]);
     }
     if (argc >= 3 && opty_is_session_name(argv[1]) && strcmp(argv[2], "start") == 0) {
         char **command_argv = &argv[3];

@@ -137,6 +137,7 @@ void opty_usage_client(const char *argv0)
     fprintf(stderr, "Usage: %s NAME start [--] [command args...]\n", prog);
     fprintf(stderr, "       %s start NAME [--] [command args...]\n", prog);
     fprintf(stderr, "       %s connect NAME\n", prog);
+    fprintf(stderr, "       %s restart NAME\n", prog);
     fprintf(stderr, "       %s NAME\n", prog);
     fprintf(stderr, "       %s list\n", prog);
     fprintf(stderr, "       %s [-t token] [-l scrollback-file] [--retry] [host:port]\n", prog);
