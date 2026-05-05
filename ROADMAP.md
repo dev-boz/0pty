@@ -1,42 +1,5 @@
 # 0pty Roadmap
 
-## v0.2.0 Current
-
-- Persistent PTY server/client.
-- Raw byte-pipe client with no terminal emulation.
-- Ring-buffer replay on reconnect.
-- Named sessions stored under `~/.0pty/sessions`.
-- `0pty list` with live/dead status.
-- Smart `0pty connect` session selection.
-- `0pty restart NAME` for dead sessions using stored cwd and argv.
-- `0pty stop NAME` for graceful named-session shutdown.
-- Session files include a `control_token` and are written atomically.
-- TCP_NODELAY is enabled on client and server sockets.
-
-## v0.2.0 Stop
-
-Implemented graceful session shutdown.
-
-Behavior:
-
-- `0pty stop NAME`
-- Session files get a `control_token`.
-- Server accepts a control shutdown frame on the same TCP listener.
-- Server validates the token before acting.
-- Default graceful path writes `graceful_input` to the PTY, currently `/exit\n`.
-- If the child does not exit after a grace period, send `SIGHUP`.
-- If it still does not exit, send `SIGTERM`.
-- Keep `SIGKILL` for a later explicit `--force` path.
-
-Design notes:
-
-- The control token is authority. PID is optional metadata, not authority.
-- A PID can be stale or recycled; a server that knows the token is the session.
-- The token lives in the user-scoped session file, so anyone who can read
-  `~/.0pty/sessions` can control that user's sessions. This matches the current
-  localhost/Tailscale/single-user threat model and should be documented in
-  `README.md`.
-
 ## v0.3.0 Session Hygiene
 
 Add explicit cleanup commands.
