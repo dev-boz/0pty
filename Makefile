@@ -44,6 +44,7 @@ test: all $(TEST_BIN)
 	$(TEST_BIN)
 	sh tests/list_dead_test.sh
 	sh tests/restart_dead_test.sh
+	sh tests/stop_test.sh
 
 clean:
 	rm -rf $(BIN_DIR) $(wildcard $(SRC_DIR)/*.o) $(wildcard $(SRC_DIR)/*.d)

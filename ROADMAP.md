@@ -1,6 +1,6 @@
 # 0pty Roadmap
 
-## v0.1.0 Current
+## v0.2.0 Current
 
 - Persistent PTY server/client.
 - Raw byte-pipe client with no terminal emulation.
@@ -9,12 +9,15 @@
 - `0pty list` with live/dead status.
 - Smart `0pty connect` session selection.
 - `0pty restart NAME` for dead sessions using stored cwd and argv.
+- `0pty stop NAME` for graceful named-session shutdown.
+- Session files include a `control_token` and are written atomically.
+- TCP_NODELAY is enabled on client and server sockets.
 
 ## v0.2.0 Stop
 
-Add graceful session shutdown.
+Implemented graceful session shutdown.
 
-Planned behavior:
+Behavior:
 
 - `0pty stop NAME`
 - Session files get a `control_token`.
@@ -90,4 +93,3 @@ preserves context.
 - Consider a session nonce in attach handshakes to avoid stale session files
   accidentally attaching to a reused port.
 - Keep framing small and auditable.
-

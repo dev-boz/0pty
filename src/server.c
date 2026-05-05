@@ -19,7 +19,11 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
+
+#define OPTY_STOP_GRACE_MS 2000L
+#define OPTY_STOP_SIGNAL_GRACE_MS 1000L
 
 struct server;
 
@@ -42,10 +46,17 @@ struct server {
     pid_t child_pid;
     pthread_mutex_t clients_mu;
     pthread_mutex_t pty_mu;
+    pthread_mutex_t child_mu;
+    pthread_mutex_t fds_mu;
     struct client *clients;
     struct opty_ring ring;
     const char *token;
+    const char *control_token;
+    int child_reaped;
+    int child_status;
 };
+
+static int server_write_pty(struct server *srv, const uint8_t *data, size_t len);
 
 static void die_perror(const char *what)
 {
@@ -55,6 +66,156 @@ static void die_perror(const char *what)
 static void die_msg(const char *what)
 {
     fprintf(stderr, "%s\n", what);
+}
+
+static void server_sleep_millis(long millis)
+{
+    struct timespec req;
+
+    req.tv_sec = millis / 1000L;
+    req.tv_nsec = (millis % 1000L) * 1000000L;
+    while (nanosleep(&req, &req) < 0 && errno == EINTR) {
+    }
+}
+
+static int server_poll_child_locked(struct server *srv)
+{
+    int status = 0;
+    pid_t done;
+
+    if (srv->child_reaped || srv->child_pid <= 0) {
+        return 1;
+    }
+
+    for (;;) {
+        done = waitpid(srv->child_pid, &status, WNOHANG);
+        if (done == srv->child_pid) {
+            srv->child_reaped = 1;
+            srv->child_status = status;
+            return 1;
+        }
+        if (done == 0) {
+            return 0;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == ECHILD) {
+            srv->child_reaped = 1;
+            return 1;
+        }
+        return -1;
+    }
+}
+
+static int server_wait_child_deadline(struct server *srv, long millis)
+{
+    long waited = 0;
+
+    for (;;) {
+        int done;
+
+        if (pthread_mutex_lock(&srv->child_mu) != 0) {
+            return -1;
+        }
+        done = server_poll_child_locked(srv);
+        pthread_mutex_unlock(&srv->child_mu);
+
+        if (done != 0) {
+            return done > 0 ? 1 : -1;
+        }
+        if (waited >= millis) {
+            return 0;
+        }
+        server_sleep_millis(50L);
+        waited += 50L;
+    }
+}
+
+static void server_wait_child_blocking(struct server *srv)
+{
+    if (pthread_mutex_lock(&srv->child_mu) != 0) {
+        return;
+    }
+
+    while (!srv->child_reaped && srv->child_pid > 0) {
+        int status = 0;
+        pid_t done = waitpid(srv->child_pid, &status, 0);
+
+        if (done == srv->child_pid) {
+            srv->child_reaped = 1;
+            srv->child_status = status;
+            break;
+        }
+        if (done < 0 && errno == EINTR) {
+            continue;
+        }
+        if (done < 0 && errno == ECHILD) {
+            srv->child_reaped = 1;
+            break;
+        }
+        break;
+    }
+
+    pthread_mutex_unlock(&srv->child_mu);
+}
+
+static void server_signal_child(struct server *srv, int signo)
+{
+    if (pthread_mutex_lock(&srv->child_mu) != 0) {
+        return;
+    }
+    if (!srv->child_reaped && srv->child_pid > 0) {
+        (void)kill(srv->child_pid, signo);
+    }
+    pthread_mutex_unlock(&srv->child_mu);
+}
+
+static void server_close_listener(struct server *srv)
+{
+    if (pthread_mutex_lock(&srv->fds_mu) != 0) {
+        return;
+    }
+    if (srv->listen_fd >= 0) {
+        int fd = srv->listen_fd;
+
+        srv->listen_fd = -1;
+        (void)shutdown(fd, SHUT_RDWR);
+        close(fd);
+    }
+    pthread_mutex_unlock(&srv->fds_mu);
+}
+
+static void server_shutdown_clients(struct server *srv)
+{
+    if (pthread_mutex_lock(&srv->clients_mu) == 0) {
+        for (struct client *c = srv->clients; c; c = c->next) {
+            (void)shutdown(c->fd, SHUT_RDWR);
+        }
+        pthread_mutex_unlock(&srv->clients_mu);
+    }
+}
+
+static void server_request_shutdown(struct server *srv, const uint8_t *input, size_t input_len)
+{
+    int done;
+
+    if (input_len > 0u) {
+        (void)server_write_pty(srv, input, input_len);
+    }
+
+    done = server_wait_child_deadline(srv, OPTY_STOP_GRACE_MS);
+    if (done == 0) {
+        server_signal_child(srv, SIGHUP);
+        done = server_wait_child_deadline(srv, OPTY_STOP_SIGNAL_GRACE_MS);
+    }
+    if (done == 0) {
+        server_signal_child(srv, SIGTERM);
+        (void)server_wait_child_deadline(srv, OPTY_STOP_SIGNAL_GRACE_MS);
+    }
+
+    server_close_listener(srv);
+    server_shutdown_clients(srv);
 }
 
 static void client_free(struct client *c)
@@ -246,19 +407,19 @@ static int server_send_welcome_and_replay(struct server *srv, struct client *c, 
     size_t replay_len = 0;
     int rc;
 
-    if (pthread_mutex_lock(&c->write_mu) != 0) {
-        return -1;
-    }
-
     if (pthread_mutex_lock(&srv->clients_mu) != 0) {
-        pthread_mutex_unlock(&c->write_mu);
+        return -1;
+    }
+    if (pthread_mutex_lock(&c->write_mu) != 0) {
+        pthread_mutex_unlock(&srv->clients_mu);
         return -1;
     }
 
+    /* Lock order for the attach path is clients_mu -> write_mu -> ring.mu. */
     uint8_t *replay = opty_ring_snapshot_from(&srv->ring, requested_seq, &from_seq, &replay_next, &replay_len);
     if (replay_len > 0 && replay == NULL) {
-        pthread_mutex_unlock(&srv->clients_mu);
         pthread_mutex_unlock(&c->write_mu);
+        pthread_mutex_unlock(&srv->clients_mu);
         return -1;
     }
     opty_ring_bounds(&srv->ring, &base_seq, &next_seq);
@@ -315,6 +476,24 @@ static int server_process_intro(struct server *srv, struct client *c, const stru
     return 0;
 }
 
+static int server_process_control_shutdown(struct server *srv, const struct opty_frame *frame)
+{
+    char token[OPTY_MAX_TOKEN + 1u];
+    const uint8_t *input = NULL;
+    size_t input_len = 0;
+
+    memset(token, 0, sizeof(token));
+    if (opty_parse_control_shutdown(frame, token, sizeof(token), &input, &input_len) < 0) {
+        return -1;
+    }
+    if (srv->control_token == NULL || srv->control_token[0] == '\0' || strcmp(srv->control_token, token) != 0) {
+        return -2;
+    }
+
+    server_request_shutdown(srv, input, input_len);
+    return 0;
+}
+
 static void *client_thread_main(void *arg)
 {
     struct client *c = arg;
@@ -330,7 +509,14 @@ static void *client_thread_main(void *arg)
         return NULL;
     }
 
-    if (frame.type != OPTY_MSG_HELLO && frame.type != OPTY_MSG_RECONNECT) {
+    if (frame.type == OPTY_MSG_CONTROL_SHUTDOWN) {
+        int control_rc = server_process_control_shutdown(srv, &frame);
+        if (control_rc == -2) {
+            (void)server_send_error(c, "control authentication failed");
+        } else if (control_rc < 0) {
+            (void)server_send_error(c, "bad control request");
+        }
+    } else if (frame.type != OPTY_MSG_HELLO && frame.type != OPTY_MSG_RECONNECT) {
         (void)server_send_error(c, "expected hello or reconnect");
     } else {
         int intro_rc = server_process_intro(srv, c, &frame);
@@ -403,25 +589,9 @@ static void *pty_thread_main(void *arg)
         }
     }
 
-    if (srv->listen_fd >= 0) {
-        (void)shutdown(srv->listen_fd, SHUT_RDWR);
-        close(srv->listen_fd);
-        srv->listen_fd = -1;
-    }
-
-    if (pthread_mutex_lock(&srv->clients_mu) == 0) {
-        for (struct client *c = srv->clients; c; c = c->next) {
-            (void)shutdown(c->fd, SHUT_RDWR);
-        }
-        pthread_mutex_unlock(&srv->clients_mu);
-    }
-
-    if (srv->child_pid > 0) {
-        int status = 0;
-        while (waitpid(srv->child_pid, &status, 0) < 0 && errno == EINTR) {
-        }
-        (void)status;
-    }
+    server_close_listener(srv);
+    server_shutdown_clients(srv);
+    server_wait_child_blocking(srv);
 
     return NULL;
 }
@@ -429,6 +599,9 @@ static void *pty_thread_main(void *arg)
 static int server_add_client(struct server *srv, int fd)
 {
     struct client *c = calloc(1, sizeof(*c));
+
+    (void)opty_set_tcp_nodelay(fd);
+
     if (c == NULL) {
         close(fd);
         return -1;
@@ -565,15 +738,19 @@ int main(int argc, char **argv)
         .port = OPTY_DEFAULT_PORT,
     };
     const char *token = NULL;
+    const char *control_token = NULL;
+    char control_token_buf[OPTY_MAX_TOKEN + 1u];
     size_t ring_size = OPTY_DEFAULT_RING_SIZE;
 
     char **child_argv = NULL;
+
+    control_token_buf[0] = '\0';
 
     opterr = 0;
     optind = 1;
 
     int opt;
-    while ((opt = getopt(argc, argv, "b:r:t:h")) != -1) {
+    while ((opt = getopt(argc, argv, "b:r:t:c:h")) != -1) {
         switch (opt) {
         case 'b':
             if (opty_parse_endpoint(optarg, OPTY_DEFAULT_HOST, OPTY_DEFAULT_PORT, &bind_ep) < 0) {
@@ -599,6 +776,14 @@ int main(int argc, char **argv)
             }
             token = optarg;
             break;
+        case 'c':
+            if (strlen(optarg) > OPTY_MAX_TOKEN) {
+                opty_usage_server(argv[0]);
+                return 2;
+            }
+            snprintf(control_token_buf, sizeof(control_token_buf), "%s", optarg);
+            control_token = control_token_buf;
+            break;
         case 'h':
             opty_usage_server(argv[0]);
             return 0;
@@ -607,6 +792,20 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+
+    if (control_token == NULL) {
+        const char *env_token = getenv("OPTY_CONTROL_TOKEN");
+
+        if (env_token != NULL && env_token[0] != '\0') {
+            if (strlen(env_token) > OPTY_MAX_TOKEN) {
+                opty_usage_server(argv[0]);
+                return 2;
+            }
+            snprintf(control_token_buf, sizeof(control_token_buf), "%s", env_token);
+            control_token = control_token_buf;
+        }
+    }
+    unsetenv("OPTY_CONTROL_TOKEN");
 
     if (optind < argc && strcmp(argv[optind], "--") == 0) {
         optind++;
@@ -635,6 +834,7 @@ int main(int argc, char **argv)
     srv.master_fd = -1;
     srv.child_pid = -1;
     srv.token = token;
+    srv.control_token = control_token;
 
     if (pthread_mutex_init(&srv.clients_mu, NULL) != 0) {
         die_msg("pthread_mutex_init");
@@ -645,8 +845,23 @@ int main(int argc, char **argv)
         pthread_mutex_destroy(&srv.clients_mu);
         return 1;
     }
+    if (pthread_mutex_init(&srv.child_mu, NULL) != 0) {
+        die_msg("pthread_mutex_init");
+        pthread_mutex_destroy(&srv.pty_mu);
+        pthread_mutex_destroy(&srv.clients_mu);
+        return 1;
+    }
+    if (pthread_mutex_init(&srv.fds_mu, NULL) != 0) {
+        die_msg("pthread_mutex_init");
+        pthread_mutex_destroy(&srv.child_mu);
+        pthread_mutex_destroy(&srv.pty_mu);
+        pthread_mutex_destroy(&srv.clients_mu);
+        return 1;
+    }
     if (opty_ring_init(&srv.ring, ring_size) < 0) {
         die_msg("ring init failed");
+        pthread_mutex_destroy(&srv.fds_mu);
+        pthread_mutex_destroy(&srv.child_mu);
         pthread_mutex_destroy(&srv.pty_mu);
         pthread_mutex_destroy(&srv.clients_mu);
         return 1;
@@ -656,6 +871,8 @@ int main(int argc, char **argv)
     if (srv.listen_fd < 0) {
         die_perror("bind/listen");
         opty_ring_destroy(&srv.ring);
+        pthread_mutex_destroy(&srv.fds_mu);
+        pthread_mutex_destroy(&srv.child_mu);
         pthread_mutex_destroy(&srv.pty_mu);
         pthread_mutex_destroy(&srv.clients_mu);
         return 1;
@@ -665,6 +882,8 @@ int main(int argc, char **argv)
         die_perror("spawn pty");
         close(srv.listen_fd);
         opty_ring_destroy(&srv.ring);
+        pthread_mutex_destroy(&srv.fds_mu);
+        pthread_mutex_destroy(&srv.child_mu);
         pthread_mutex_destroy(&srv.pty_mu);
         pthread_mutex_destroy(&srv.clients_mu);
         return 1;
@@ -680,6 +899,8 @@ int main(int argc, char **argv)
         }
         close(srv.master_fd);
         opty_ring_destroy(&srv.ring);
+        pthread_mutex_destroy(&srv.fds_mu);
+        pthread_mutex_destroy(&srv.child_mu);
         pthread_mutex_destroy(&srv.pty_mu);
         pthread_mutex_destroy(&srv.clients_mu);
         return 1;

@@ -33,6 +33,8 @@
 #define OPTY_SESSION_PORT_BASE 6077ul
 #define OPTY_LIST_CONNECT_TIMEOUT_MS 250
 #define OPTY_SESSION_MAX_ARGC 128
+#define OPTY_CONTROL_TOKEN_BYTES 32u
+#define OPTY_STOP_WAIT_MS 7000L
 
 static volatile sig_atomic_t g_sigwinch_pending = 0;
 static volatile sig_atomic_t g_terminate_pending = 0;
@@ -48,6 +50,8 @@ struct opty_session_info {
     char log[512];
     char cwd[1024];
     char restart_policy[64];
+    char control_token[OPTY_MAX_TOKEN + 1u];
+    char graceful_input[OPTY_MAX_GRACEFUL_INPUT + 1u];
     char command[1024];
     size_t argc;
     char *argv[OPTY_SESSION_MAX_ARGC + 1u];
@@ -195,6 +199,7 @@ static int connect_endpoint(const struct opty_endpoint *endpoint)
             continue;
         }
         if (connect(sock, it->ai_addr, it->ai_addrlen) == 0) {
+            (void)opty_set_tcp_nodelay(sock);
             break;
         }
         close(sock);
@@ -535,18 +540,39 @@ static int opty_session_dir(char *buf, size_t cap)
     return 0;
 }
 
+static int opty_log_dir(char *buf, size_t cap)
+{
+    const char *home = getenv("HOME");
+
+    if (home == NULL || home[0] == '\0') {
+        errno = ENOENT;
+        return -1;
+    }
+    if (snprintf(buf, cap, "%s/.0pty/logs", home) >= (int)cap) {
+        errno = ENOSPC;
+        return -1;
+    }
+    return 0;
+}
+
 static int opty_ensure_session_dir(void)
 {
     char root[512];
     char dir[512];
+    char log_dir[512];
 
-    if (opty_session_root(root, sizeof(root)) < 0 || opty_session_dir(dir, sizeof(dir)) < 0) {
+    if (opty_session_root(root, sizeof(root)) < 0 ||
+        opty_session_dir(dir, sizeof(dir)) < 0 ||
+        opty_log_dir(log_dir, sizeof(log_dir)) < 0) {
         return -1;
     }
     if (mkdir(root, 0700) < 0 && errno != EEXIST) {
         return -1;
     }
     if (mkdir(dir, 0700) < 0 && errno != EEXIST) {
+        return -1;
+    }
+    if (mkdir(log_dir, 0700) < 0 && errno != EEXIST) {
         return -1;
     }
     return 0;
@@ -572,11 +598,16 @@ static int opty_session_path(const char *session, char *buf, size_t cap)
 
 static int opty_session_log_path(const char *session, char *buf, size_t cap)
 {
+    char dir[512];
+
     if (!opty_is_session_name(session)) {
         errno = EINVAL;
         return -1;
     }
-    if (snprintf(buf, cap, "/tmp/0pty-%s.log", session) >= (int)cap) {
+    if (opty_log_dir(dir, sizeof(dir)) < 0) {
+        return -1;
+    }
+    if (snprintf(buf, cap, "%s/%s.log", dir, session) >= (int)cap) {
         errno = ENOSPC;
         return -1;
     }
@@ -590,6 +621,38 @@ static void opty_chomp(char *line)
     while (len > 0u && (line[len - 1u] == '\n' || line[len - 1u] == '\r')) {
         line[--len] = '\0';
     }
+}
+
+static int opty_generate_control_token(char *buf, size_t cap)
+{
+    static const char hex[] = "0123456789abcdef";
+    uint8_t bytes[OPTY_CONTROL_TOKEN_BYTES];
+    int fd;
+
+    if (buf == NULL || cap < OPTY_CONTROL_TOKEN_BYTES * 2u + 1u) {
+        errno = ENOSPC;
+        return -1;
+    }
+
+    fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    if (opty_read_full(fd, bytes, sizeof(bytes)) != (ssize_t)sizeof(bytes)) {
+        int saved_errno = errno;
+
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    close(fd);
+
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        buf[i * 2u] = hex[(bytes[i] >> 4) & 0x0fu];
+        buf[i * 2u + 1u] = hex[bytes[i] & 0x0fu];
+    }
+    buf[sizeof(bytes) * 2u] = '\0';
+    return 0;
 }
 
 static int opty_read_session_endpoint(const char *session, char *port_buf, size_t port_cap, struct opty_endpoint *endpoint)
@@ -641,14 +704,25 @@ static int opty_read_session_endpoint(const char *session, char *port_buf, size_
     return 0;
 }
 
-static int opty_write_session(const char *session, const struct opty_endpoint *endpoint, const char *log_path, char **command_argv)
+static int opty_write_session(const char *session, const struct opty_endpoint *endpoint, const char *log_path,
+                              const char *control_token, char **command_argv)
 {
     char path[1024];
+    char tmp_path[1100];
     char cwd[1024];
-    FILE *fp;
+    FILE *fp = NULL;
+    int fd = -1;
     size_t argc = 0;
 
     if (opty_ensure_session_dir() < 0 || opty_session_path(session, path, sizeof(path)) < 0) {
+        return -1;
+    }
+    if (control_token == NULL || control_token[0] == '\0' || strlen(control_token) > OPTY_MAX_TOKEN) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", path, (long)getpid()) >= (int)sizeof(tmp_path)) {
+        errno = ENOSPC;
         return -1;
     }
 
@@ -662,10 +736,20 @@ static int opty_write_session(const char *session, const struct opty_endpoint *e
         }
     }
 
-    fp = fopen(path, "w");
-    if (fp == NULL) {
+    fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
         return -1;
     }
+    fp = fdopen(fd, "w");
+    if (fp == NULL) {
+        int saved_errno = errno;
+
+        close(fd);
+        unlink(tmp_path);
+        errno = saved_errno;
+        return -1;
+    }
+    fd = -1;
 
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
         cwd[0] = '\0';
@@ -676,6 +760,7 @@ static int opty_write_session(const char *session, const struct opty_endpoint *e
     fprintf(fp, "port=%s\n", endpoint->port);
     fprintf(fp, "log=%s\n", log_path);
     fprintf(fp, "restart_policy=manual\n");
+    fprintf(fp, "control_token=%s\n", control_token);
     fprintf(fp, "graceful_input=/exit\\n\n");
     fprintf(fp, "argc=%zu\n", argc);
     if (argc > 0u) {
@@ -692,9 +777,29 @@ static int opty_write_session(const char *session, const struct opty_endpoint *e
         fprintf(fp, "cwd=%s\n", cwd);
     }
 
-    if (fclose(fp) != 0) {
+    if (ferror(fp) || fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        int saved_errno = errno;
+
+        fclose(fp);
+        unlink(tmp_path);
+        errno = saved_errno;
         return -1;
     }
+    if (fclose(fp) != 0) {
+        int saved_errno = errno;
+
+        unlink(tmp_path);
+        errno = saved_errno;
+        return -1;
+    }
+    if (rename(tmp_path, path) < 0) {
+        int saved_errno = errno;
+
+        unlink(tmp_path);
+        errno = saved_errno;
+        return -1;
+    }
+
     return 0;
 }
 
@@ -747,6 +852,43 @@ static int opty_endpoint_accepts(const struct opty_endpoint *endpoint)
     }
     close(fd);
     return 1;
+}
+
+static int opty_endpoint_bindable(const struct opty_endpoint *endpoint)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *it;
+    int bindable = 0;
+    int rc;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_ADDRCONFIG;
+
+    rc = getaddrinfo(endpoint->host, endpoint->port, &hints, &res);
+    if (rc != 0) {
+        errno = EINVAL;
+        return 0;
+    }
+
+    for (it = res; it != NULL && !bindable; it = it->ai_next) {
+        int fd = socket(it->ai_family, it->ai_socktype | SOCK_CLOEXEC, it->ai_protocol);
+        int one = 1;
+
+        if (fd < 0) {
+            continue;
+        }
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (bind(fd, it->ai_addr, it->ai_addrlen) == 0) {
+            bindable = 1;
+        }
+        close(fd);
+    }
+
+    freeaddrinfo(res);
+    return bindable;
 }
 
 static int opty_endpoint_accepts_timeout(const struct opty_endpoint *endpoint, int timeout_ms)
@@ -819,6 +961,7 @@ static void opty_session_info_init(struct opty_session_info *info, const char *f
     }
     snprintf(info->host, sizeof(info->host), "%s", OPTY_DEFAULT_HOST);
     snprintf(info->restart_policy, sizeof(info->restart_policy), "%s", "manual");
+    snprintf(info->graceful_input, sizeof(info->graceful_input), "%s", "/exit\\n");
 }
 
 static int opty_copy_field(char *dst, size_t cap, const char *src)
@@ -921,6 +1064,18 @@ static int opty_read_session_info(const char *session, struct opty_session_info 
                 opty_session_info_free(info);
                 return -1;
             }
+        } else if (strcmp(line, "control_token") == 0) {
+            if (opty_copy_field(info->control_token, sizeof(info->control_token), value) < 0) {
+                fclose(fp);
+                opty_session_info_free(info);
+                return -1;
+            }
+        } else if (strcmp(line, "graceful_input") == 0) {
+            if (opty_copy_field(info->graceful_input, sizeof(info->graceful_input), value) < 0) {
+                fclose(fp);
+                opty_session_info_free(info);
+                return -1;
+            }
         } else if (strcmp(line, "command") == 0) {
             if (opty_copy_field(info->command, sizeof(info->command), value) < 0) {
                 fclose(fp);
@@ -993,7 +1148,7 @@ static int opty_pick_session_endpoint(char *port_buf, size_t port_cap, struct op
         }
         endpoint->host = OPTY_DEFAULT_HOST;
         endpoint->port = port_buf;
-        if (!opty_endpoint_accepts(endpoint)) {
+        if (opty_endpoint_bindable(endpoint)) {
             return 0;
         }
     }
@@ -1039,13 +1194,74 @@ static int opty_wait_for_server(pid_t pid, const struct opty_endpoint *endpoint,
     return -1;
 }
 
+static int opty_decode_graceful_input(const char *value, uint8_t *out, size_t cap, size_t *len_out)
+{
+    size_t len = 0;
+
+    if (value == NULL || out == NULL || len_out == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    for (const char *p = value; *p != '\0'; p++) {
+        unsigned char ch = (unsigned char)*p;
+
+        if (ch == '\\' && p[1] != '\0') {
+            p++;
+            switch (*p) {
+            case 'n':
+                ch = '\n';
+                break;
+            case 'r':
+                ch = '\r';
+                break;
+            case 't':
+                ch = '\t';
+                break;
+            case '\\':
+                ch = '\\';
+                break;
+            default:
+                ch = (unsigned char)*p;
+                break;
+            }
+        }
+
+        if (len == cap) {
+            errno = EMSGSIZE;
+            return -1;
+        }
+        out[len++] = ch;
+    }
+
+    *len_out = len;
+    return 0;
+}
+
+static int opty_wait_endpoint_dead(const struct opty_endpoint *endpoint, long timeout_ms)
+{
+    long waited = 0;
+
+    while (waited <= timeout_ms) {
+        if (!opty_endpoint_accepts_timeout(endpoint, 100)) {
+            return 0;
+        }
+        opty_sleep_millis(100L);
+        waited += 100L;
+    }
+
+    errno = ETIMEDOUT;
+    return -1;
+}
+
 static int opty_spawn_server(const char *argv0, const char *session, const struct opty_endpoint *endpoint,
-                             const char *log_path, char **command_argv)
+                             const char *log_path, const char *control_token, char **command_argv)
 {
     char endpoint_arg[128];
     char *server_path;
     char **exec_argv;
     size_t command_count = 0;
+    size_t exec_index = 0;
     pid_t pid;
 
     if (snprintf(endpoint_arg, sizeof(endpoint_arg), "%s:%s", endpoint->host, endpoint->port) >= (int)sizeof(endpoint_arg)) {
@@ -1069,14 +1285,14 @@ static int opty_spawn_server(const char *argv0, const char *session, const struc
         free(server_path);
         return -1;
     }
-    exec_argv[0] = server_path;
-    exec_argv[1] = "-b";
-    exec_argv[2] = endpoint_arg;
-    exec_argv[3] = "--";
+    exec_argv[exec_index++] = server_path;
+    exec_argv[exec_index++] = "-b";
+    exec_argv[exec_index++] = endpoint_arg;
+    exec_argv[exec_index++] = "--";
     for (size_t i = 0; i < command_count; i++) {
-        exec_argv[4u + i] = command_argv[i];
+        exec_argv[exec_index++] = command_argv[i];
     }
-    exec_argv[4u + command_count] = NULL;
+    exec_argv[exec_index] = NULL;
 
     pid = fork();
     if (pid < 0) {
@@ -1088,6 +1304,12 @@ static int opty_spawn_server(const char *argv0, const char *session, const struc
     if (pid == 0) {
         int log_fd;
         int null_fd;
+
+        if (control_token != NULL && control_token[0] != '\0' &&
+            setenv("OPTY_CONTROL_TOKEN", control_token, 1) < 0) {
+            perror("set OPTY_CONTROL_TOKEN");
+            _exit(127);
+        }
 
         (void)setsid();
         null_fd = open("/dev/null", O_RDONLY);
@@ -1233,6 +1455,110 @@ static int run_named_connect(const char *session)
     }
 
     return run_client_endpoint(&endpoint, NULL, NULL, false);
+}
+
+static int run_named_stop(const char *session)
+{
+    struct opty_session_info info;
+    struct opty_endpoint endpoint;
+    uint8_t graceful_input[OPTY_MAX_GRACEFUL_INPUT];
+    size_t graceful_len = 0;
+    int sock;
+    int status = 0;
+    long waited = 0;
+
+    if (!opty_is_session_name(session)) {
+        fprintf(stderr, "invalid session name: %s\n", session);
+        return 1;
+    }
+    if (opty_read_session_info(session, &info) < 0) {
+        fprintf(stderr, "no such 0pty session: %s\n", session);
+        return 1;
+    }
+    if (info.control_token[0] == '\0') {
+        fprintf(stderr, "session %s has no control token; restart it with the current 0pty before stopping\n", session);
+        opty_session_info_free(&info);
+        return 1;
+    }
+
+    endpoint.host = info.host;
+    endpoint.port = info.port;
+    if (!opty_endpoint_accepts_timeout(&endpoint, OPTY_LIST_CONNECT_TIMEOUT_MS)) {
+        fprintf(stderr, "0pty session %s is already dead\n", session);
+        opty_session_info_free(&info);
+        return 0;
+    }
+
+    if (opty_decode_graceful_input(info.graceful_input, graceful_input, sizeof(graceful_input), &graceful_len) < 0) {
+        perror("decode graceful_input");
+        opty_session_info_free(&info);
+        return 1;
+    }
+
+    sock = connect_endpoint(&endpoint);
+    if (sock < 0) {
+        perror("connect");
+        opty_session_info_free(&info);
+        return 1;
+    }
+    if (opty_send_control_shutdown(sock, info.control_token, graceful_input, graceful_len) < 0) {
+        perror("send stop");
+        close(sock);
+        opty_session_info_free(&info);
+        return 1;
+    }
+    (void)shutdown(sock, SHUT_WR);
+
+    while (waited < OPTY_STOP_WAIT_MS) {
+        struct pollfd pfd;
+        int rc;
+
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        rc = poll(&pfd, 1u, 100);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            status = 1;
+            break;
+        }
+        if (rc == 0) {
+            waited += 100L;
+            continue;
+        }
+        if ((pfd.revents & POLLIN) != 0) {
+            struct opty_frame frame = {0};
+            int frame_rc = opty_recv_frame(sock, &frame);
+
+            if (frame_rc == 0 && frame.type == OPTY_MSG_ERROR) {
+                write_stderr_bytes(frame.payload, frame.len);
+                status = 1;
+            } else if (frame_rc < 0) {
+                status = 1;
+            }
+            opty_frame_free(&frame);
+            break;
+        }
+        if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            break;
+        }
+    }
+
+    close(sock);
+
+    if (status == 0 && opty_wait_endpoint_dead(&endpoint, OPTY_STOP_WAIT_MS) < 0) {
+        fprintf(stderr, "sent stop request for %s, but it is still listening on %s:%s\n",
+                session, endpoint.host, endpoint.port);
+        status = 1;
+    }
+    if (status == 0) {
+        fprintf(stderr, "stopped 0pty session %s\n", session);
+    }
+
+    opty_session_info_free(&info);
+    return status;
 }
 
 static void opty_print_session_list(const struct opty_list_entry *entries, size_t count)
@@ -1401,7 +1727,8 @@ static int run_connect_auto(void)
 static int run_named_start(const char *argv0, const char *session, char **command_argv)
 {
     char port[16];
-    char log_path[128];
+    char log_path[512];
+    char control_token[OPTY_CONTROL_TOKEN_BYTES * 2u + 1u];
     struct opty_endpoint endpoint;
 
     if (!opty_is_session_name(session)) {
@@ -1413,15 +1740,16 @@ static int run_named_start(const char *argv0, const char *session, char **comman
         fprintf(stderr, "0pty session %s is already listening on %s:%s; connecting\n", session, endpoint.host, endpoint.port);
     } else {
         if (opty_pick_session_endpoint(port, sizeof(port), &endpoint) < 0 ||
-            opty_session_log_path(session, log_path, sizeof(log_path)) < 0) {
+            opty_session_log_path(session, log_path, sizeof(log_path)) < 0 ||
+            opty_generate_control_token(control_token, sizeof(control_token)) < 0) {
             perror("allocate 0pty session");
             return 1;
         }
-        if (opty_write_session(session, &endpoint, log_path, command_argv) < 0) {
+        if (opty_write_session(session, &endpoint, log_path, control_token, command_argv) < 0) {
             perror("write 0pty session");
             return 1;
         }
-        if (opty_spawn_server(argv0, session, &endpoint, log_path, command_argv) < 0) {
+        if (opty_spawn_server(argv0, session, &endpoint, log_path, control_token, command_argv) < 0) {
             perror("start 0pty session");
             return 1;
         }
@@ -1473,7 +1801,8 @@ static int run_named_restart(const char *argv0, const char *session)
         return 1;
     }
 
-    if (opty_spawn_server(argv0, session, &endpoint, info.log[0] != '\0' ? info.log : "/tmp/0pty-restart.log", info.argv) < 0) {
+    if (opty_spawn_server(argv0, session, &endpoint, info.log[0] != '\0' ? info.log : "/tmp/0pty-restart.log",
+                          info.control_token[0] != '\0' ? info.control_token : NULL, info.argv) < 0) {
         perror("restart 0pty session");
         if (have_current_cwd) {
             (void)chdir(current_cwd);
@@ -1519,6 +1848,9 @@ int main(int argc, char **argv)
     if (argc >= 3 && strcmp(argv[1], "connect") == 0) {
         return run_named_connect(argv[2]);
     }
+    if (argc >= 3 && strcmp(argv[1], "stop") == 0) {
+        return run_named_stop(argv[2]);
+    }
     if (argc >= 3 && strcmp(argv[1], "restart") == 0) {
         return run_named_restart(argv[0], argv[2]);
     }
@@ -1527,6 +1859,9 @@ int main(int argc, char **argv)
     }
     if (argc >= 3 && opty_is_session_name(argv[1]) && strcmp(argv[2], "connect") == 0) {
         return run_named_connect(argv[1]);
+    }
+    if (argc >= 3 && opty_is_session_name(argv[1]) && strcmp(argv[2], "stop") == 0) {
+        return run_named_stop(argv[1]);
     }
     if (argc >= 3 && opty_is_session_name(argv[1]) && strcmp(argv[2], "restart") == 0) {
         return run_named_restart(argv[0], argv[1]);

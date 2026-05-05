@@ -45,7 +45,7 @@ Start the agent directly, not a shell:
 0pty claude01 start claude --resume
 ```
 
-This means future stop, restart, and crash recovery workflows can know what
+This means stop, restart, and crash recovery workflows can know what
 command to run, what directory to use, and how to ask the agent to exit cleanly.
 
 Avoid this for agent sessions:
@@ -85,6 +85,9 @@ attaches immediately.
 
 # restart a dead session from its stored cwd and argv
 0pty restart codexCoder
+
+# ask a live session to exit cleanly
+0pty stop codexCoder
 ```
 
 Commands are passed as normal argv, so extra flags work:
@@ -106,6 +109,8 @@ the current user and checks liveness with a short TCP connect probe.
 `0pty restart NAME` works only for dead sessions. It reuses the start-time
 working directory and exact argv stored in the session file; it refuses to
 replace an alive session.
+`0pty stop NAME` sends the session's stored `graceful_input` to the live PTY
+and waits for the server to shut down. The default graceful input is `/exit\n`.
 
 ## Raw Endpoint Mode
 
@@ -149,6 +154,7 @@ The current message set covers:
 - `ACK`
 - `REPLAY`
 - `ERROR`
+- `CONTROL_SHUTDOWN`
 
 Sequence numbers identify the server byte stream. The client remembers the last sequence it saw, sends that on reconnect, and the server replies with a replay frame followed by live output.
 
@@ -156,12 +162,23 @@ Sequence numbers identify the server byte stream. The client remembers the last 
 
 The transport is not SSH. Bind only to `127.0.0.1` or a private/Tailscale address and keep the optional shared token enabled for non-local use. The service file under `systemd/` defaults to localhost for that reason.
 
+Named session files are user-scoped and stored under `~/.0pty/sessions` with
+0600 permissions. The `control_token` in that file is the authority for
+`0pty stop`; anyone who can read the session file can stop that user's session.
+
 ## v0.1.0
 
 v0.1.0 includes the core persistent PTY server/client, named sessions, `list`,
-smart `connect`, and manual `restart` for dead sessions. `stop`, automatic
-supervision, and disk-persisted server scrollback are intentionally left for
-later releases.
+smart `connect`, and manual `restart` for dead sessions.
+
+## v0.2.0
+
+v0.2.0 adds graceful named-session shutdown with `0pty stop NAME`, per-session
+control tokens, TCP_NODELAY for lower interactive latency, atomic session file
+writes, and user-scoped log paths under `~/.0pty/logs`.
+
+Automatic supervision and disk-persisted server scrollback are intentionally
+left for later releases.
 
 ## Reconnect Workflow
 

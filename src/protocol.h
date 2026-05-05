@@ -11,6 +11,7 @@
 #define OPTY_DEFAULT_RING_SIZE (1024u * 1024u)
 #define OPTY_MAX_FRAME (16u * 1024u * 1024u)
 #define OPTY_MAX_TOKEN 255u
+#define OPTY_MAX_GRACEFUL_INPUT 4096u
 
 enum opty_msg_type {
     OPTY_MSG_HELLO = 1,
@@ -21,7 +22,8 @@ enum opty_msg_type {
     OPTY_MSG_RESIZE = 6,
     OPTY_MSG_ACK = 7,
     OPTY_MSG_REPLAY = 8,
-    OPTY_MSG_ERROR = 9
+    OPTY_MSG_ERROR = 9,
+    OPTY_MSG_CONTROL_SHUTDOWN = 10
 };
 
 struct opty_frame {
@@ -51,11 +53,13 @@ int opty_send_stdout(int fd, uint64_t seq, const void *data, size_t len);
 int opty_send_replay(int fd, uint64_t from_seq, const void *data, size_t len);
 int opty_send_welcome(int fd, uint64_t base_seq, uint64_t next_seq);
 int opty_send_error(int fd, const char *message);
+int opty_send_control_shutdown(int fd, const char *token, const void *input, size_t input_len);
 
 int opty_parse_client_intro(const struct opty_frame *frame, uint64_t *last_seq, uint16_t *cols, uint16_t *rows, char *token, size_t token_cap);
 int opty_parse_resize(const struct opty_frame *frame, uint16_t *cols, uint16_t *rows);
 int opty_parse_ack(const struct opty_frame *frame, uint64_t *seq);
 int opty_parse_stream(const struct opty_frame *frame, uint64_t *seq, const uint8_t **data, size_t *len);
 int opty_parse_welcome(const struct opty_frame *frame, uint64_t *base_seq, uint64_t *next_seq);
+int opty_parse_control_shutdown(const struct opty_frame *frame, char *token, size_t token_cap, const uint8_t **input, size_t *input_len);
 
 #endif

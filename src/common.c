@@ -3,9 +3,12 @@
 #include "protocol.h"
 
 #include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 
 static char *opty_dup_range(const char *start, size_t len)
 {
@@ -121,11 +124,18 @@ fail:
     return -1;
 }
 
+int opty_set_tcp_nodelay(int fd)
+{
+    int one = 1;
+
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
 void opty_usage_server(const char *argv0)
 {
     const char *prog = argv0 != NULL ? argv0 : "0pty-server";
 
-    fprintf(stderr, "Usage: %s [-b host:port] [-r bytes] [-t token] [--] [command args...]\n", prog);
+    fprintf(stderr, "Usage: %s [-b host:port] [-r bytes] [-t token] [-c control-token] [--] [command args...]\n", prog);
     fprintf(stderr, "Default listen endpoint: %s:%s\n", OPTY_DEFAULT_HOST, OPTY_DEFAULT_PORT);
     fprintf(stderr, "Default command: $SHELL, or /bin/sh when SHELL is unset\n");
 }
@@ -138,8 +148,10 @@ void opty_usage_client(const char *argv0)
     fprintf(stderr, "       %s start NAME [--] [command args...]\n", prog);
     fprintf(stderr, "       %s connect\n", prog);
     fprintf(stderr, "       %s connect NAME\n", prog);
+    fprintf(stderr, "       %s stop NAME\n", prog);
     fprintf(stderr, "       %s restart NAME\n", prog);
     fprintf(stderr, "       %s NAME\n", prog);
+    fprintf(stderr, "       %s NAME stop\n", prog);
     fprintf(stderr, "       %s list\n", prog);
     fprintf(stderr, "       %s [-t token] [-l scrollback-file] [--retry] [host:port]\n", prog);
     fprintf(stderr, "Session names use letters, digits, dots, dashes, and underscores.\n");

@@ -40,7 +40,9 @@ static int test_frame_roundtrip(void)
     uint16_t rows = 0;
     char token[16];
     const uint8_t *stream;
+    const uint8_t *shutdown_input;
     size_t stream_len = 0;
+    size_t shutdown_input_len = 0;
 
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
 
@@ -94,6 +96,15 @@ static int test_frame_roundtrip(void)
     REQUIRE(opty_parse_welcome(&frame, &base_seq, &next_seq) == 0);
     REQUIRE(base_seq == 10u);
     REQUIRE(next_seq == 42u);
+    opty_frame_free(&frame);
+
+    REQUIRE(opty_send_control_shutdown(sv[0], "stop-token", "/exit\n", 6u) == 0);
+    REQUIRE(opty_recv_frame(sv[1], &frame) == 0);
+    REQUIRE(frame.type == OPTY_MSG_CONTROL_SHUTDOWN);
+    REQUIRE(opty_parse_control_shutdown(&frame, token, sizeof(token), &shutdown_input, &shutdown_input_len) == 0);
+    REQUIRE(strcmp(token, "stop-token") == 0);
+    REQUIRE(shutdown_input_len == 6u);
+    REQUIRE(memcmp(shutdown_input, "/exit\n", 6u) == 0);
     opty_frame_free(&frame);
 
     close(sv[0]);
