@@ -1,6 +1,6 @@
 # 0pty
 
-Run your agents on a server instead of a local terminal. Reconnect to your session after closing the terminal or restarting your computer.
+Run your agents on a server instead of a local terminal. Reconnect to your session after closing the terminal or restarting your computer. Connect multiple terminals or your phone to the same session.
 
 0pty is a dependency-free Linux PTY persistence daemon/client pair for long-running interactive CLI programs: coding agents, shells, REPLs, debuggers, and anything else that expects a PTY. The server keeps a PTY alive, streams raw output, and replays recent output from a ring buffer when a client reconnects. The client is a byte pipe: stdin to the socket, socket to stdout.
 
@@ -13,6 +13,8 @@ Interactive CLI agents save conversations as JSON, but if the terminal crashes h
 The fix: Run it inside a daemon on your dev machine that holds the PTY open permanently. Connect to it from whatever terminal you want. If the terminal crashes, the process doesn't. Reconnect, pick up where you left off. The conversation is never at risk because the process never died.
 
 This isn't a terminal emulator. It's a PTY babysitter with a ring buffer and a TCP socket.
+
+Side benefit: you can go to lunch and connect via termux on your phone and keep coding!
 
 ---
 
