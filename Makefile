@@ -1,6 +1,8 @@
 CC ?= cc
 SRC_DIR := src
 BIN_DIR := bin
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 
 CFLAGS += -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror
 CPPFLAGS += -I$(SRC_DIR) -MMD -MP
@@ -46,9 +48,14 @@ test: all $(TEST_BIN)
 	sh tests/restart_dead_test.sh
 	sh tests/stop_test.sh
 
+install: all
+	install -d "$(DESTDIR)$(BINDIR)"
+	install -m 0755 "$(BIN_DIR)/0pty" "$(DESTDIR)$(BINDIR)/0pty"
+	install -m 0755 "$(BIN_DIR)/0pty-server" "$(DESTDIR)$(BINDIR)/0pty-server"
+
 clean:
 	rm -rf $(BIN_DIR) $(wildcard $(SRC_DIR)/*.o) $(wildcard $(SRC_DIR)/*.d)
 
 -include $(wildcard $(SRC_DIR)/*.d)
 
-.PHONY: all clean test
+.PHONY: all clean install test

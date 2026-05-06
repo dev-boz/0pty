@@ -9,13 +9,17 @@ Planned commands:
 - `0pty rm NAME`
 - `0pty prune`
 - `0pty logs NAME`
+- CLI support for setting `graceful_input` at session start
 
 Rules:
 
 - `list` should not auto-delete dead sessions.
 - `rm NAME` removes one session record after confirming it is not alive.
 - `prune` removes confirmed-dead session records.
-- `logs NAME` prints or tails the session log path from the session file.
+- Named sessions already store a server log path under `~/.0pty/logs`.
+- `logs NAME` prints or tails that existing path from the session file.
+- `graceful_input` is already stored in session files and can be edited
+  manually; a first-class CLI option is still pending.
 
 ## v0.4.0 Install And Shell Polish
 
@@ -23,8 +27,6 @@ Make the tool easier to install and use interactively.
 
 Planned work:
 
-- `make install PREFIX=...`
-- Install both `0pty` and `0pty-server`.
 - Optional shell completions.
 - Better examples for SSH/Tailscale workflows.
 

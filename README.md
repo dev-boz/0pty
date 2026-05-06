@@ -22,7 +22,7 @@ This isn't a terminal emulator. It's a PTY babysitter with a ring buffer and a T
 
 ## The Name
 
-0pt is the font size that renders nothing. Pronounced "op-tee."
+Zero point font renders nothing - 0pt + PTY. Pronounced "op-tee."
 
 ---
 
@@ -41,7 +41,19 @@ The build uses `cc` by default, or `gcc`/another C11 compiler if you set `CC`. T
 
 `make test` builds both binaries and runs the protocol/ring-buffer regression test.
 
-Copy `bin/0pty` and `bin/0pty-server` to somewhere in your `$PATH`, or run them directly from the build directory.
+Install both binaries with:
+
+```sh
+make install PREFIX=/usr/local
+```
+
+Use `DESTDIR` for package staging, for example:
+
+```sh
+make install DESTDIR=/tmp/pkgroot PREFIX=/usr/local
+```
+
+You can also copy `bin/0pty` and `bin/0pty-server` to somewhere in your `$PATH`, or run them directly from the build directory.
 
 ## Recommended Workflow
 
@@ -117,6 +129,14 @@ working directory and exact argv stored in the session file; it refuses to
 replace an alive session.
 `0pty stop NAME` sends the session's stored `graceful_input` to the live PTY
 and waits for the server to shut down. The default graceful input is `/exit\n`.
+For tools that use a different shutdown command, edit `graceful_input=` in
+`~/.0pty/sessions/NAME.session`. The value supports `\n`, `\r`, `\t`, and `\\`
+escapes; examples include `exit\n` for a shell and `quit()\n` for a Python REPL.
+
+`start` also stores a per-session server log path under `~/.0pty/logs/NAME.log`.
+That file is for `0pty-server` output and startup/restart diagnostics; it is not
+a complete terminal transcript. Raw endpoint clients can write received PTY
+output to a scrollback file with `0pty -l FILE host:port`.
 
 ## Raw Endpoint Mode
 
