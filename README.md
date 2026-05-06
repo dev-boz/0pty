@@ -1,4 +1,4 @@
-![0pty](header.png)
+<img src="header.png" width="512" alt="0pty">
 
 # 0pty
 
