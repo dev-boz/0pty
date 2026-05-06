@@ -1,4 +1,6 @@
-<img src="header.png" width="512" alt="0pty">
+<p align="center">
+  <img src="header.png" width="512" alt="0pty">
+</p>
 
 # 0pty
 
