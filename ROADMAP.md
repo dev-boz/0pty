@@ -26,7 +26,6 @@ Planned work:
 - `make install PREFIX=...`
 - Install both `0pty` and `0pty-server`.
 - Optional shell completions.
-- README install section.
 - Better examples for SSH/Tailscale workflows.
 
 ## Later

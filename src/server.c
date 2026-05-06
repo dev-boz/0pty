@@ -58,12 +58,12 @@ struct server {
 
 static int server_write_pty(struct server *srv, const uint8_t *data, size_t len);
 
-static void die_perror(const char *what)
+static void log_perror(const char *what)
 {
     perror(what);
 }
 
-static void die_msg(const char *what)
+static void log_msg(const char *what)
 {
     fprintf(stderr, "%s\n", what);
 }
@@ -824,7 +824,7 @@ int main(int argc, char **argv)
     }
 
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-        die_perror("signal");
+        log_perror("signal");
         return 1;
     }
 
@@ -837,29 +837,29 @@ int main(int argc, char **argv)
     srv.control_token = control_token;
 
     if (pthread_mutex_init(&srv.clients_mu, NULL) != 0) {
-        die_msg("pthread_mutex_init");
+        log_msg("pthread_mutex_init");
         return 1;
     }
     if (pthread_mutex_init(&srv.pty_mu, NULL) != 0) {
-        die_msg("pthread_mutex_init");
+        log_msg("pthread_mutex_init");
         pthread_mutex_destroy(&srv.clients_mu);
         return 1;
     }
     if (pthread_mutex_init(&srv.child_mu, NULL) != 0) {
-        die_msg("pthread_mutex_init");
+        log_msg("pthread_mutex_init");
         pthread_mutex_destroy(&srv.pty_mu);
         pthread_mutex_destroy(&srv.clients_mu);
         return 1;
     }
     if (pthread_mutex_init(&srv.fds_mu, NULL) != 0) {
-        die_msg("pthread_mutex_init");
+        log_msg("pthread_mutex_init");
         pthread_mutex_destroy(&srv.child_mu);
         pthread_mutex_destroy(&srv.pty_mu);
         pthread_mutex_destroy(&srv.clients_mu);
         return 1;
     }
     if (opty_ring_init(&srv.ring, ring_size) < 0) {
-        die_msg("ring init failed");
+        log_msg("ring init failed");
         pthread_mutex_destroy(&srv.fds_mu);
         pthread_mutex_destroy(&srv.child_mu);
         pthread_mutex_destroy(&srv.pty_mu);
@@ -869,7 +869,7 @@ int main(int argc, char **argv)
 
     srv.listen_fd = server_create_listener(bind_ep.host, bind_ep.port);
     if (srv.listen_fd < 0) {
-        die_perror("bind/listen");
+        log_perror("bind/listen");
         opty_ring_destroy(&srv.ring);
         pthread_mutex_destroy(&srv.fds_mu);
         pthread_mutex_destroy(&srv.child_mu);
@@ -879,7 +879,7 @@ int main(int argc, char **argv)
     }
 
     if (server_spawn_pty(&srv, child_argv) < 0) {
-        die_perror("spawn pty");
+        log_perror("spawn pty");
         close(srv.listen_fd);
         opty_ring_destroy(&srv.ring);
         pthread_mutex_destroy(&srv.fds_mu);
@@ -891,7 +891,7 @@ int main(int argc, char **argv)
 
     pthread_t pty_thread;
     if (pthread_create(&pty_thread, NULL, pty_thread_main, &srv) != 0) {
-        die_msg("pthread_create");
+        log_msg("pthread_create");
         close(srv.listen_fd);
         if (srv.child_pid > 0) {
             kill(srv.child_pid, SIGTERM);
@@ -921,7 +921,7 @@ int main(int argc, char **argv)
                 usleep(100000);
                 continue;
             }
-            die_perror("accept");
+            log_perror("accept");
             break;
         }
 

@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Adjust this path if you install the binary somewhere else.
+# Replace /bin/bash with your actual command, e.g. /usr/bin/claude --resume
+# Adjust the path to 0pty-server if you installed it somewhere else.
 ExecStart=/usr/local/bin/0pty-server -b 127.0.0.1:6077 -- /bin/bash
 Restart=always
 RestartSec=1

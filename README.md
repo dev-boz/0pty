@@ -1,3 +1,5 @@
+![0pty](header.png)
+
 # 0pty
 
 Run your agents on a server instead of a local terminal. Reconnect to your active session after closing the terminal or restarting your computer. Connect from multiple devices at once --desktop, laptop, phone-- all in the same session.
@@ -18,7 +20,7 @@ This isn't a terminal emulator. It's a PTY babysitter with a ring buffer and a T
 
 ## The Name
 
-0pt is the font size that renders nothing. That's the client: zero rendering, zero parsing. Pronounced "op-tee."
+0pt is the font size that renders nothing. Pronounced "op-tee."
 
 ---
 
@@ -36,6 +38,8 @@ This builds:
 The build uses `cc` by default, or `gcc`/another C11 compiler if you set `CC`. The server links `pthread` and `util`; the client links `pthread`.
 
 `make test` builds both binaries and runs the protocol/ring-buffer regression test.
+
+Copy `bin/0pty` and `bin/0pty-server` to somewhere in your `$PATH`, or run them directly from the build directory.
 
 ## Recommended Workflow
 
@@ -141,6 +145,53 @@ bin/0pty-server -b 127.0.0.1:6077 -- claude --resume
 
 The server is meant to stay bound to localhost or a Tailscale interface. Do not expose it on `0.0.0.0`.
 
+### Tailscale
+
+Bind to your Tailscale IP to reach the session from any device on your tailnet:
+
+```sh
+tailscale ip -4          # find your address
+0pty claude01 start claude --resume   # named-session on Tailscale
+# or raw:
+bin/0pty-server -b 100.x.y.z:6077 -- claude --resume
+```
+
+From any other Tailscale device:
+
+```sh
+bin/0pty 100.x.y.z:6077
+```
+
+Traffic is WireGuard-encrypted. See `examples/tailscale.md` for a full walkthrough including systemd setup.
+
+### SSH
+
+If you don't use Tailscale, keep the server bound to `127.0.0.1` on the remote machine and use SSH local port forwarding to bring the port to your laptop:
+
+```sh
+# on your laptop — forward local 6077 to localhost:6077 on the dev box
+ssh -L 6077:127.0.0.1:6077 user@dev-box -N &
+
+# then attach from your laptop as if the server were local
+0pty connect claude01
+# or raw:
+bin/0pty 127.0.0.1:6077
+```
+
+The `-N` flag keeps the tunnel open without running a remote command. Close it with `kill %1` or `fg` + Ctrl-C when done.
+
+For a persistent tunnel that reconnects automatically, add to your `~/.ssh/config`:
+
+```
+Host dev-box
+    HostName your.server.example.com
+    LocalForward 6077 127.0.0.1:6077
+    ServerAliveInterval 30
+    ExitOnForwardFailure yes
+```
+
+Then `ssh dev-box -N` (or with `autossh` for auto-reconnect) keeps the port available locally whenever you need it. See `examples/ssh.md` for a full walkthrough.
+
 ## Protocol
 
 Frames are length-prefixed. Each message is a 4-byte big-endian length, a 1-byte message type, and the payload.
@@ -158,6 +209,8 @@ The current message set covers:
 
 Sequence numbers identify the server byte stream. The client remembers the last sequence it saw, sends that on reconnect, and the server replies with a replay frame followed by live output.
 
+The ring buffer is **1 MB** by default. This is set at compile time via `OPTY_DEFAULT_RING_SIZE` in `src/protocol.h`.
+
 ## Security
 
 The transport is not SSH. Bind only to `127.0.0.1` or a private/Tailscale address and keep the optional shared token enabled for non-local use. The service file under `systemd/` defaults to localhost for that reason.
@@ -166,19 +219,9 @@ Named session files are user-scoped and stored under `~/.0pty/sessions` with
 0600 permissions. The `control_token` in that file is the authority for
 `0pty stop`; anyone who can read the session file can stop that user's session.
 
-## v0.1.0
+## Changelog
 
-v0.1.0 includes the core persistent PTY server/client, named sessions, `list`,
-smart `connect`, and manual `restart` for dead sessions.
-
-## v0.2.0
-
-v0.2.0 adds graceful named-session shutdown with `0pty stop NAME`, per-session
-control tokens, TCP_NODELAY for lower interactive latency, atomic session file
-writes, and user-scoped log paths under `~/.0pty/logs`.
-
-Automatic supervision and disk-persisted server scrollback are intentionally
-left for later releases.
+See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## Reconnect Workflow
 
