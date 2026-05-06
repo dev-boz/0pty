@@ -6,37 +6,31 @@ to the internet.
 
 ## On the dev box
 
-Bind `0pty-server` to the Tailscale interface instead of localhost:
+For direct access from other devices, bind `0pty-server` to the Tailscale
+interface instead of localhost:
 
 ```sh
 # find your Tailscale IP
 tailscale ip -4
 
 # start a persistent claude session on that interface
-0pty claude01 start claude --resume
-```
-
-`0pty start` picks a free localhost port by default. To bind directly to the
-Tailscale address for raw-endpoint use:
-
-```sh
 bin/0pty-server -b 100.x.y.z:6077 -- claude --resume
 ```
+
+Named `0pty NAME start` sessions currently pick a free localhost port. Use raw
+endpoint mode for direct Tailscale access until named sessions grow an explicit
+bind option.
 
 The server is single-binary with no daemon dependency; run it however you like.
 
 ## From any other Tailscale device
 
 ```sh
-# named-session shorthand (if you used 0pty start on the dev box)
-0pty connect claude01        # by name — requires the session file to be synced
-                              # or use the raw endpoint form:
 bin/0pty 100.x.y.z:6077
 ```
 
-If you use named sessions from multiple machines, copy or sync
-`~/.0pty/sessions/claude01` to the connecting device so `0pty connect claude01`
-can resolve the host and port.
+If you prefer named sessions, keep them bound to localhost on the dev box and
+use SSH forwarding as shown in `examples/ssh.md`.
 
 ## systemd on the dev box
 
@@ -52,5 +46,15 @@ systemctl --user enable --now 0pty-server
 
 Tailscale traffic is WireGuard-encrypted end-to-end. Binding to your Tailscale
 address is safe for trusted devices on your tailnet. Do not bind to `0.0.0.0`.
-Enable the optional shared token (`-t TOKEN`) if any tailnet device should not
-have unconditional access to the PTY.
+Enable the optional shared token if any tailnet device should not have
+unconditional access to the PTY:
+
+```sh
+export OPTY_TOKEN='choose-a-long-random-value'
+
+# server
+bin/0pty-server -b 100.x.y.z:6077 -t "$OPTY_TOKEN" -- claude --resume
+
+# client
+bin/0pty -t "$OPTY_TOKEN" 100.x.y.z:6077
+```

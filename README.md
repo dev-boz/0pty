@@ -20,6 +20,20 @@ This isn't a terminal emulator. It's a PTY babysitter with a ring buffer and a T
 
 ---
 
+## Why 0pty?
+
+`tmux` and `screen` are terminal multiplexers. They are broader tools with
+terminal emulation, windows, panes, status bars, key bindings, and a long-lived
+terminal UI. 0pty is narrower: it keeps one PTY-backed process alive and moves
+raw bytes between that PTY and attached clients.
+
+`dtach` is closer in spirit because it also avoids terminal multiplexing, but a
+detached client misses output printed while it was away. 0pty keeps a bounded
+server-side replay buffer, so reconnecting clients can catch up on recent output
+before live output resumes.
+
+---
+
 ## The Name
 
 Zero point font renders nothing - 0pt + PTY. Pronounced "op-tee."
@@ -41,6 +55,12 @@ The build uses `cc` by default, or `gcc`/another C11 compiler if you set `CC`. T
 
 `make test` builds both binaries and runs the protocol/ring-buffer regression test.
 
+On Debian or Ubuntu, the usual build toolchain is enough:
+
+```sh
+sudo apt-get install build-essential
+```
+
 Install both binaries with:
 
 ```sh
@@ -54,6 +74,12 @@ make install DESTDIR=/tmp/pkgroot PREFIX=/usr/local
 ```
 
 You can also copy `bin/0pty` and `bin/0pty-server` to somewhere in your `$PATH`, or run them directly from the build directory.
+
+## Supported Platforms
+
+Linux is the supported target today for both `0pty-server` and `0pty`. CI runs
+on Ubuntu. WSL2 should be treated as unverified Linux; native macOS and Windows
+support is not implemented yet.
 
 ## Recommended Workflow
 
@@ -129,6 +155,10 @@ working directory and exact argv stored in the session file; it refuses to
 replace an alive session.
 `0pty stop NAME` sends the session's stored `graceful_input` to the live PTY
 and waits for the server to shut down. The default graceful input is `/exit\n`.
+Detaching does not require a command: close the terminal window running the
+client, or leave it attached and open another client. The server process and
+PTY stay alive until the program exits or you run `0pty stop NAME`.
+
 For tools that use a different shutdown command, edit `graceful_input=` in
 `~/.0pty/sessions/NAME.session`. The value supports `\n`, `\r`, `\t`, and `\\`
 escapes; examples include `exit\n` for a shell and `quit()\n` for a Python REPL.
@@ -169,12 +199,12 @@ The server is meant to stay bound to localhost or a Tailscale interface. Do not 
 
 ### Tailscale
 
-Bind to your Tailscale IP to reach the session from any device on your tailnet:
+Named sessions bind to localhost today. To reach a session directly from other
+devices on your tailnet, use raw endpoint mode and bind `0pty-server` to your
+Tailscale IP:
 
 ```sh
 tailscale ip -4          # find your address
-0pty claude01 start claude --resume   # named-session on Tailscale
-# or raw:
 bin/0pty-server -b 100.x.y.z:6077 -- claude --resume
 ```
 
@@ -236,6 +266,23 @@ The ring buffer is **1 MB** by default. This is set at compile time via `OPTY_DE
 ## Security
 
 The transport is not SSH. Bind only to `127.0.0.1` or a private/Tailscale address and keep the optional shared token enabled for non-local use. The service file under `systemd/` defaults to localhost for that reason.
+
+For raw endpoint mode on a private or Tailscale interface, set the same shared
+token on the server and client:
+
+```sh
+export OPTY_TOKEN='choose-a-long-random-value'
+
+# server
+bin/0pty-server -b 100.x.y.z:6077 -t "$OPTY_TOKEN" -- claude --resume
+
+# client
+bin/0pty -t "$OPTY_TOKEN" 100.x.y.z:6077
+```
+
+The shared token is an application-level attach secret, not encryption. Use SSH
+forwarding or Tailscale for transport security. Named sessions also store a
+separate `control_token` used only for `0pty stop NAME`.
 
 Named session files are user-scoped and stored under `~/.0pty/sessions` with
 0600 permissions. The `control_token` in that file is the authority for

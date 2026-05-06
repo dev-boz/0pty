@@ -28,7 +28,7 @@ Make the tool easier to install and use interactively.
 Planned work:
 
 - Optional shell completions.
-- Better examples for SSH/Tailscale workflows.
+- Named-session bind options for private/Tailscale interfaces.
 
 ## Later
 
@@ -50,6 +50,15 @@ The default remains `manual`.
 Persist server-side ring-buffer snapshots so a server restart can still provide
 recent scrollback history. This does not preserve the running process; it only
 preserves context.
+
+### Portability
+
+- Keep Linux as the supported server target until non-Linux PTY behavior is
+  deliberately tested.
+- Validate WSL2 as a supported Linux environment.
+- Investigate native macOS client support for attaching to Linux servers.
+- Treat native Windows support as a separate design project, not a small build
+  flag change.
 
 ### Protocol Hardening
 
