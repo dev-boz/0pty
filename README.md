@@ -162,7 +162,7 @@ From any other Tailscale device:
 bin/0pty 100.x.y.z:6077
 ```
 
-Traffic is WireGuard-encrypted. See `examples/tailscale.md` for a full walkthrough including systemd setup.
+Traffic is WireGuard-encrypted. See [examples/tailscale.md](examples/tailscale.md) for a full walkthrough including systemd setup.
 
 ### SSH
 
@@ -190,7 +190,7 @@ Host dev-box
     ExitOnForwardFailure yes
 ```
 
-Then `ssh dev-box -N` (or with `autossh` for auto-reconnect) keeps the port available locally whenever you need it. See `examples/ssh.md` for a full walkthrough.
+Then `ssh dev-box -N` (or with `autossh` for auto-reconnect) keeps the port available locally whenever you need it. See [examples/ssh.md](examples/ssh.md) for a full walkthrough.
 
 ## Protocol
 
