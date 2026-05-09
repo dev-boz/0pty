@@ -143,8 +143,9 @@ static int test_ring_buffer(void)
     REQUIRE(base == 5u);
     REQUIRE(next == 10u);
 
-    snap = opty_ring_snapshot_from(&ring, 2u, &from, &next, &len);
+    snap = opty_ring_snapshot_window(&ring, 2u, &base, &from, &next, &len);
     REQUIRE(snap != NULL);
+    REQUIRE(base == 5u);
     REQUIRE(from == 5u);
     REQUIRE(next == 10u);
     REQUIRE(len == 5u);
@@ -161,10 +162,29 @@ static int test_ring_buffer(void)
     return 0;
 }
 
+static int test_frame_limit(void)
+{
+    int sv[2];
+    struct opty_frame frame;
+    const uint8_t data[] = { 'o', 'p', 't', 'y', 'x' };
+
+    memset(&frame, 0, sizeof(frame));
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    REQUIRE(opty_send_stdin(sv[0], data, sizeof(data)) == 0);
+    errno = 0;
+    REQUIRE(opty_recv_frame_limited(sv[1], &frame, 4u) < 0);
+    REQUIRE(errno == EMSGSIZE);
+    opty_frame_free(&frame);
+    close(sv[0]);
+    close(sv[1]);
+    return 0;
+}
+
 int main(void)
 {
     REQUIRE(test_endian_helpers() == 0);
     REQUIRE(test_frame_roundtrip() == 0);
     REQUIRE(test_ring_buffer() == 0);
+    REQUIRE(test_frame_limit() == 0);
     return 0;
 }

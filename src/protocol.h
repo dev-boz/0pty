@@ -12,6 +12,7 @@
 #define OPTY_MAX_FRAME (16u * 1024u * 1024u)
 #define OPTY_MAX_TOKEN 255u
 #define OPTY_MAX_GRACEFUL_INPUT 4096u
+#define OPTY_MAX_UNAUTH_PAYLOAD (1u + 1u + OPTY_MAX_TOKEN + 2u + OPTY_MAX_GRACEFUL_INPUT)
 
 enum opty_msg_type {
     OPTY_MSG_HELLO = 1,
@@ -36,6 +37,7 @@ ssize_t opty_read_full(int fd, void *buf, size_t len);
 ssize_t opty_write_full(int fd, const void *buf, size_t len);
 
 int opty_send_frame(int fd, uint8_t type, const void *payload, size_t len);
+int opty_recv_frame_limited(int fd, struct opty_frame *frame, size_t max_payload_len);
 int opty_recv_frame(int fd, struct opty_frame *frame);
 void opty_frame_free(struct opty_frame *frame);
 

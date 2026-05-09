@@ -25,6 +25,8 @@
 #define OPTY_STOP_GRACE_MS 2000L
 #define OPTY_STOP_SIGNAL_GRACE_MS 1000L
 
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
 struct server;
 
 struct client {
@@ -66,6 +68,53 @@ static void log_perror(const char *what)
 static void log_msg(const char *what)
 {
     fprintf(stderr, "%s\n", what);
+}
+
+static void on_shutdown_signal(int signo)
+{
+    (void)signo;
+    g_shutdown_requested = 1;
+}
+
+static int server_install_signal_handler(int signo, void (*handler)(int))
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(signo, &sa, NULL) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int server_setup_signal_handlers(void)
+{
+    if (server_install_signal_handler(SIGHUP, on_shutdown_signal) < 0) {
+        return -1;
+    }
+    if (server_install_signal_handler(SIGINT, on_shutdown_signal) < 0) {
+        return -1;
+    }
+    if (server_install_signal_handler(SIGTERM, on_shutdown_signal) < 0) {
+        return -1;
+    }
+    if (server_install_signal_handler(SIGQUIT, on_shutdown_signal) < 0) {
+        return -1;
+    }
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        return -1;
+    }
+    return 0;
+}
+
+static void server_store_token(char *dst, size_t cap, const char *src)
+{
+    size_t len = strlen(src);
+
+    memset(dst, 0, cap);
+    memcpy(dst, src, len);
 }
 
 static void server_sleep_millis(long millis)
@@ -171,6 +220,20 @@ static void server_signal_child(struct server *srv, int signo)
     pthread_mutex_unlock(&srv->child_mu);
 }
 
+static int server_tokens_equal(const char *expected, const char *actual)
+{
+    unsigned char diff = 0;
+
+    if (expected == NULL || actual == NULL) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < OPTY_MAX_TOKEN + 1u; i++) {
+        diff |= (unsigned char)((unsigned char)expected[i] ^ (unsigned char)actual[i]);
+    }
+    return diff == 0u;
+}
+
 static void server_close_listener(struct server *srv)
 {
     if (pthread_mutex_lock(&srv->fds_mu) != 0) {
@@ -211,7 +274,11 @@ static void server_request_shutdown(struct server *srv, const uint8_t *input, si
     }
     if (done == 0) {
         server_signal_child(srv, SIGTERM);
-        (void)server_wait_child_deadline(srv, OPTY_STOP_SIGNAL_GRACE_MS);
+        done = server_wait_child_deadline(srv, OPTY_STOP_SIGNAL_GRACE_MS);
+    }
+    if (done == 0) {
+        server_signal_child(srv, SIGKILL);
+        server_wait_child_blocking(srv);
     }
 
     server_close_listener(srv);
@@ -225,21 +292,32 @@ static void client_free(struct client *c)
     free(c);
 }
 
-static void client_release_locked(struct client *c)
+static int client_release_locked(struct client *c)
 {
     if (c->refs == 0) {
-        return;
+        return 0;
     }
     c->refs--;
     if (c->refs == 0) {
         client_free(c);
+        return 1;
+    }
+    return 0;
+}
+
+static void client_release_many_locked(struct client *c, int refs)
+{
+    int freed = 0;
+
+    while (refs-- > 0 && !freed) {
+        freed = client_release_locked(c);
     }
 }
 
-static void server_drop_from_list_locked(struct server *srv, struct client *c)
+static int server_drop_from_list_locked(struct server *srv, struct client *c)
 {
     if (!c->in_list) {
-        return;
+        return 0;
     }
 
     struct client **cur = &srv->clients;
@@ -250,16 +328,16 @@ static void server_drop_from_list_locked(struct server *srv, struct client *c)
         *cur = c->next;
     }
     c->in_list = 0;
-    client_release_locked(c);
+    return 1;
 }
 
-static void server_mark_dead_locked(struct server *srv, struct client *c)
+static int server_mark_dead_locked(struct server *srv, struct client *c)
 {
     if (!c->dead) {
         c->dead = 1;
         (void)shutdown(c->fd, SHUT_RDWR);
     }
-    server_drop_from_list_locked(srv, c);
+    return server_drop_from_list_locked(srv, c);
 }
 
 static struct client **server_snapshot_clients(struct server *srv, size_t *count_out)
@@ -350,7 +428,7 @@ static int server_broadcast_stdout(struct server *srv, uint64_t seq, const uint8
         pthread_mutex_unlock(&c->write_mu);
         if (rc < 0) {
             if (pthread_mutex_lock(&srv->clients_mu) == 0) {
-                server_mark_dead_locked(srv, c);
+                client_release_many_locked(c, server_mark_dead_locked(srv, c));
                 pthread_mutex_unlock(&srv->clients_mu);
             }
         }
@@ -401,7 +479,6 @@ static int server_send_error(struct client *c, const char *msg)
 static int server_send_welcome_and_replay(struct server *srv, struct client *c, uint64_t requested_seq)
 {
     uint64_t base_seq = 0;
-    uint64_t next_seq = 0;
     uint64_t from_seq = 0;
     uint64_t replay_next = 0;
     size_t replay_len = 0;
@@ -416,19 +493,18 @@ static int server_send_welcome_and_replay(struct server *srv, struct client *c, 
     }
 
     /* Lock order for the attach path is clients_mu -> write_mu -> ring.mu. */
-    uint8_t *replay = opty_ring_snapshot_from(&srv->ring, requested_seq, &from_seq, &replay_next, &replay_len);
+    uint8_t *replay = opty_ring_snapshot_window(&srv->ring, requested_seq, &base_seq, &from_seq, &replay_next, &replay_len);
     if (replay_len > 0 && replay == NULL) {
         pthread_mutex_unlock(&c->write_mu);
         pthread_mutex_unlock(&srv->clients_mu);
         return -1;
     }
-    opty_ring_bounds(&srv->ring, &base_seq, &next_seq);
 
     c->authenticated = 1;
     c->live_seq = replay_next;
     pthread_mutex_unlock(&srv->clients_mu);
 
-    rc = opty_send_welcome(c->fd, base_seq, next_seq);
+    rc = opty_send_welcome(c->fd, base_seq, replay_next);
     if (rc == 0) {
         rc = opty_send_replay(c->fd, from_seq, replay, replay_len);
     }
@@ -441,8 +517,7 @@ static int server_send_welcome_and_replay(struct server *srv, struct client *c, 
 static void server_finish_client(struct server *srv, struct client *c)
 {
     if (pthread_mutex_lock(&srv->clients_mu) == 0) {
-        server_mark_dead_locked(srv, c);
-        client_release_locked(c);
+        client_release_many_locked(c, 1 + server_mark_dead_locked(srv, c));
         pthread_mutex_unlock(&srv->clients_mu);
     }
 }
@@ -461,7 +536,7 @@ static int server_process_intro(struct server *srv, struct client *c, const stru
     if (cols == 0 || rows == 0) {
         return -1;
     }
-    if (srv->token != NULL && srv->token[0] != '\0' && strcmp(srv->token, token) != 0) {
+    if (srv->token != NULL && srv->token[0] != '\0' && !server_tokens_equal(srv->token, token)) {
         return -2;
     }
 
@@ -486,7 +561,8 @@ static int server_process_control_shutdown(struct server *srv, const struct opty
     if (opty_parse_control_shutdown(frame, token, sizeof(token), &input, &input_len) < 0) {
         return -1;
     }
-    if (srv->control_token == NULL || srv->control_token[0] == '\0' || strcmp(srv->control_token, token) != 0) {
+    if (srv->control_token == NULL || srv->control_token[0] == '\0' ||
+        !server_tokens_equal(srv->control_token, token)) {
         return -2;
     }
 
@@ -504,7 +580,7 @@ static void *client_thread_main(void *arg)
     struct opty_frame frame;
     memset(&frame, 0, sizeof(frame));
 
-    if (opty_recv_frame(c->fd, &frame) < 0) {
+    if (opty_recv_frame_limited(c->fd, &frame, OPTY_MAX_UNAUTH_PAYLOAD) < 0) {
         server_finish_client(srv, c);
         return NULL;
     }
@@ -566,8 +642,6 @@ static void *client_thread_main(void *arg)
 static void *pty_thread_main(void *arg)
 {
     struct server *srv = arg;
-
-    pthread_detach(pthread_self());
 
     uint8_t buf[4096];
     for (;;) {
@@ -634,8 +708,7 @@ static int server_add_client(struct server *srv, int fd)
 
     if (pthread_create(&c->thread, NULL, client_thread_main, c) != 0) {
         if (pthread_mutex_lock(&srv->clients_mu) == 0) {
-            server_mark_dead_locked(srv, c);
-            client_release_locked(c);
+            client_release_many_locked(c, 1 + server_mark_dead_locked(srv, c));
             pthread_mutex_unlock(&srv->clients_mu);
         }
         return -1;
@@ -719,6 +792,14 @@ static int server_create_listener(const char *host, const char *port)
 
         int one = 1;
         (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (ai->ai_family == AF_INET6) {
+            int zero = 0;
+
+            if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero)) < 0) {
+                close(fd);
+                continue;
+            }
+        }
 
         if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 16) == 0) {
             listen_fd = fd;
@@ -739,12 +820,14 @@ int main(int argc, char **argv)
     };
     const char *token = NULL;
     const char *control_token = NULL;
+    char token_buf[OPTY_MAX_TOKEN + 1u];
     char control_token_buf[OPTY_MAX_TOKEN + 1u];
     size_t ring_size = OPTY_DEFAULT_RING_SIZE;
 
     char **child_argv = NULL;
 
-    control_token_buf[0] = '\0';
+    memset(token_buf, 0, sizeof(token_buf));
+    memset(control_token_buf, 0, sizeof(control_token_buf));
 
     opterr = 0;
     optind = 1;
@@ -774,14 +857,15 @@ int main(int argc, char **argv)
                 opty_usage_server(argv[0]);
                 return 2;
             }
-            token = optarg;
+            server_store_token(token_buf, sizeof(token_buf), optarg);
+            token = token_buf;
             break;
         case 'c':
             if (strlen(optarg) > OPTY_MAX_TOKEN) {
                 opty_usage_server(argv[0]);
                 return 2;
             }
-            snprintf(control_token_buf, sizeof(control_token_buf), "%s", optarg);
+            server_store_token(control_token_buf, sizeof(control_token_buf), optarg);
             control_token = control_token_buf;
             break;
         case 'h':
@@ -801,7 +885,7 @@ int main(int argc, char **argv)
                 opty_usage_server(argv[0]);
                 return 2;
             }
-            snprintf(control_token_buf, sizeof(control_token_buf), "%s", env_token);
+            server_store_token(control_token_buf, sizeof(control_token_buf), env_token);
             control_token = control_token_buf;
         }
     }
@@ -823,8 +907,8 @@ int main(int argc, char **argv)
         child_argv = default_argv;
     }
 
-    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-        log_perror("signal");
+    if (server_setup_signal_handlers() < 0) {
+        log_perror("sigaction");
         return 1;
     }
 
@@ -906,12 +990,23 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    int status = 0;
     for (;;) {
         struct sockaddr_storage ss;
         socklen_t slen = sizeof(ss);
+
+        if (g_shutdown_requested) {
+            g_shutdown_requested = 0;
+            server_request_shutdown(&srv, NULL, 0);
+        }
+
         int fd = accept(srv.listen_fd, (struct sockaddr *)&ss, &slen);
         if (fd < 0) {
             if (errno == EINTR) {
+                if (g_shutdown_requested) {
+                    g_shutdown_requested = 0;
+                    server_request_shutdown(&srv, NULL, 0);
+                }
                 continue;
             }
             if (errno == EBADF || errno == EINVAL) {
@@ -922,11 +1017,17 @@ int main(int argc, char **argv)
                 continue;
             }
             log_perror("accept");
+            status = 1;
+            server_request_shutdown(&srv, NULL, 0);
             break;
         }
 
         (void)server_add_client(&srv, fd);
     }
 
-    return 0;
+    (void)pthread_join(pty_thread, NULL);
+    if (srv.master_fd >= 0) {
+        close(srv.master_fd);
+    }
+    return status;
 }

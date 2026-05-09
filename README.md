@@ -155,9 +155,14 @@ working directory and exact argv stored in the session file; it refuses to
 replace an alive session.
 `0pty stop NAME` sends the session's stored `graceful_input` to the live PTY
 and waits for the server to shut down. The default graceful input is `/exit\n`.
+Sessions that were already live before v0.2.0 need one `0pty restart NAME`
+before `0pty stop NAME` works, because older session files do not have a
+stored `control_token`.
 Detaching does not require a command: close the terminal window running the
 client, or leave it attached and open another client. The server process and
 PTY stay alive until the program exits or you run `0pty stop NAME`.
+When multiple clients are attached, the shared PTY follows the most recent
+resize sent by any client.
 
 For tools that use a different shutdown command, edit `graceful_input=` in
 `~/.0pty/sessions/NAME.session`. The value supports `\n`, `\r`, `\t`, and `\\`
@@ -248,6 +253,10 @@ Then `ssh dev-box -N` (or with `autossh` for auto-reconnect) keeps the port avai
 
 Frames are length-prefixed. Each message is a 4-byte big-endian length, a 1-byte message type, and the payload.
 
+The first client frame on a connection must be `HELLO`, `RECONNECT`, or
+`CONTROL_SHUTDOWN`. Any other first frame gets an `ERROR` response and the
+server closes the connection.
+
 The current message set covers:
 
 - `HELLO` / `RECONNECT`
@@ -265,7 +274,9 @@ The ring buffer is **1 MB** by default. This is set at compile time via `OPTY_DE
 
 ## Security
 
-The transport is not SSH. Bind only to `127.0.0.1` or a private/Tailscale address and keep the optional shared token enabled for non-local use. The service file under `systemd/` defaults to localhost for that reason.
+The transport is not SSH. Bind only to `127.0.0.1` or a private/Tailscale
+address and keep a shared attach token enabled for non-local use. The example
+service file under `systemd/` defaults to localhost for that reason.
 
 For raw endpoint mode on a private or Tailscale interface, set the same shared
 token on the server and client:
@@ -282,7 +293,10 @@ bin/0pty -t "$OPTY_TOKEN" 100.x.y.z:6077
 
 The shared token is an application-level attach secret, not encryption. Use SSH
 forwarding or Tailscale for transport security. Named sessions also store a
-separate `control_token` used only for `0pty stop NAME`.
+separate `control_token` used only for `0pty stop NAME`. The example
+`systemd/0pty-server.service` leaves `OPTY_CONTROL_TOKEN` unset by default,
+which disables `CONTROL_SHUTDOWN` requests until you provide one via
+`EnvironmentFile=` or `-c`.
 
 Named session files are user-scoped and stored under `~/.0pty/sessions` with
 0600 permissions. The `control_token` in that file is the authority for

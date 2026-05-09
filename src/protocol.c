@@ -166,16 +166,20 @@ int opty_send_frame(int fd, uint8_t type, const void *payload, size_t len)
     return 0;
 }
 
-int opty_recv_frame(int fd, struct opty_frame *frame)
+int opty_recv_frame_limited(int fd, struct opty_frame *frame, size_t max_payload_len)
 {
     uint8_t prefix[4];
     uint8_t type;
     uint32_t wire_len;
     size_t payload_len;
+    size_t payload_cap = max_payload_len;
 
     if (frame == NULL) {
         errno = EINVAL;
         return -1;
+    }
+    if (payload_cap > (size_t)(OPTY_MAX_FRAME - 1u)) {
+        payload_cap = (size_t)(OPTY_MAX_FRAME - 1u);
     }
 
     frame->type = 0;
@@ -195,7 +199,7 @@ int opty_recv_frame(int fd, struct opty_frame *frame)
                ((uint32_t)prefix[2] << 8) |
                (uint32_t)prefix[3];
 
-    if (wire_len < 1u || wire_len > OPTY_MAX_FRAME) {
+    if (wire_len < 1u || wire_len > OPTY_MAX_FRAME || ((size_t)wire_len - 1u) > payload_cap) {
         errno = EMSGSIZE;
         return -1;
     }
@@ -225,6 +229,11 @@ int opty_recv_frame(int fd, struct opty_frame *frame)
     frame->type = type;
     frame->len = payload_len;
     return 0;
+}
+
+int opty_recv_frame(int fd, struct opty_frame *frame)
+{
+    return opty_recv_frame_limited(fd, frame, (size_t)(OPTY_MAX_FRAME - 1u));
 }
 
 void opty_frame_free(struct opty_frame *frame)

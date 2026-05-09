@@ -104,7 +104,8 @@ void opty_ring_append(struct opty_ring *ring, const uint8_t *data, size_t len, u
     pthread_mutex_unlock(&ring->mu);
 }
 
-uint8_t *opty_ring_snapshot_from(struct opty_ring *ring, uint64_t requested_seq, uint64_t *from_seq, uint64_t *next_seq, size_t *len)
+uint8_t *opty_ring_snapshot_window(struct opty_ring *ring, uint64_t requested_seq, uint64_t *base_seq,
+                                   uint64_t *from_seq, uint64_t *next_seq, size_t *len)
 {
     uint64_t from;
     uint64_t end;
@@ -121,6 +122,9 @@ uint8_t *opty_ring_snapshot_from(struct opty_ring *ring, uint64_t requested_seq,
         return NULL;
     }
 
+    if (base_seq != NULL) {
+        *base_seq = ring->base_seq;
+    }
     if (requested_seq < ring->base_seq) {
         from = ring->base_seq;
     } else if (requested_seq > ring->next_seq) {
@@ -161,6 +165,11 @@ uint8_t *opty_ring_snapshot_from(struct opty_ring *ring, uint64_t requested_seq,
 
     pthread_mutex_unlock(&ring->mu);
     return out;
+}
+
+uint8_t *opty_ring_snapshot_from(struct opty_ring *ring, uint64_t requested_seq, uint64_t *from_seq, uint64_t *next_seq, size_t *len)
+{
+    return opty_ring_snapshot_window(ring, requested_seq, NULL, from_seq, next_seq, len);
 }
 
 void opty_ring_bounds(struct opty_ring *ring, uint64_t *base_seq, uint64_t *next_seq)

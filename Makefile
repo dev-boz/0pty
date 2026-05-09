@@ -46,6 +46,7 @@ test: all $(TEST_BIN)
 	$(TEST_BIN)
 	sh tests/list_dead_test.sh
 	sh tests/restart_dead_test.sh
+	sh tests/session_metadata_test.sh
 	sh tests/stop_test.sh
 
 install: all

@@ -32,6 +32,13 @@ Planned work:
 
 ## Later
 
+### Access Modes
+
+- Add a read-only attach mode for viewers who should receive PTY output without
+  being able to send input or resize events.
+- Add a one-connection-at-a-time mode for sessions that should refuse new
+  attachers while one client is already active.
+
 ### `0pty-supervisor`
 
 Keep the PTY server dumb and auditable. Put automatic restart policy in a

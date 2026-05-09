@@ -6,6 +6,7 @@ All notable changes to this project are documented here.
 
 - Add graceful named-session shutdown: `0pty stop NAME` sends the session's stored `graceful_input` to the live PTY and waits for the server to exit cleanly
 - Per-session control tokens stored in `~/.0pty/sessions` with 0600 permissions
+- Existing sessions started before v0.2.0 need one restart before `0pty stop NAME` works, because older session files do not include a control token
 - `TCP_NODELAY` enabled for lower interactive latency
 - Atomic session file writes
 - User-scoped log paths under `~/.0pty/logs`

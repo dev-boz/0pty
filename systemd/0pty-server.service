@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=simple
 # Replace /bin/bash with your actual command, e.g. /usr/bin/claude --resume
 # Adjust the path to 0pty-server if you installed it somewhere else.
+# Load OPTY_CONTROL_TOKEN=... here if you want CONTROL_SHUTDOWN requests.
+# Leaving it unset disables control requests instead of accepting them.
+# EnvironmentFile=-%h/.config/0pty/0pty-server.env
 ExecStart=/usr/local/bin/0pty-server -b 127.0.0.1:6077 -- /bin/bash
 Restart=always
 RestartSec=1

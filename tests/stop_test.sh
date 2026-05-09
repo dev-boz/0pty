@@ -13,9 +13,14 @@ trap cleanup EXIT HUP INT TERM
 
 export HOME=$TMP_HOME
 
+SESSION_FILE="$HOME/.0pty/sessions/$SESSION.session"
+LOG_FILE="$HOME/.0pty/logs/$SESSION.log"
+mkdir -p "$HOME/.0pty/logs"
+: >"$LOG_FILE"
+chmod 0644 "$LOG_FILE"
+
 ( sleep 1 ) | "$ROOT_DIR/bin/0pty" "$SESSION" start -- /bin/sh -c 'printf "ready\n"; IFS= read line; test "$line" = /exit' >"$TMP_HOME/start.out" 2>"$TMP_HOME/start.err"
 
-SESSION_FILE="$HOME/.0pty/sessions/$SESSION.session"
 test -f "$SESSION_FILE" || {
     echo "FAIL: session file not created"
     exit 1
@@ -30,6 +35,14 @@ grep -q '^graceful_input=/exit\\n$' "$SESSION_FILE" || {
 }
 test "$(stat -c %a "$SESSION_FILE")" = "600" || {
     echo "FAIL: session file permissions are not 0600"
+    exit 1
+}
+test -f "$LOG_FILE" || {
+    echo "FAIL: session log not created"
+    exit 1
+}
+test "$(stat -c %a "$LOG_FILE")" = "600" || {
+    echo "FAIL: session log permissions are not 0600"
     exit 1
 }
 
